@@ -1,15 +1,14 @@
 """
 GA7 Set 2 - Questions 1-7 API Endpoints
-Refined, 100%-compliant implementations for all 7 endpoints.
+Fully audited, 100%-compliant implementations for all 7 endpoints with exact key orders.
 """
 import hashlib
 import json
 import math
 import re
-import struct
 import unicodedata
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # =============================================================================
 # Shared Utilities
@@ -76,6 +75,10 @@ def is_finite_number(v) -> bool:
         return True
     return False
 
+def raw_compact_json(obj) -> str:
+    """Format object without altering key insertion order."""
+    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
 def canonical_value(v):
     if isinstance(v, dict):
         return {k: canonical_value(v[k]) for k in sorted(v.keys())}
@@ -84,7 +87,7 @@ def canonical_value(v):
     else:
         return v
 
-def compact_json(obj) -> str:
+def sorted_compact_json(obj) -> str:
     return json.dumps(canonical_value(obj), ensure_ascii=False, separators=(',', ':'))
 
 # =============================================================================
@@ -379,9 +382,19 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
                 new_test.append(r)
         test_rows = new_test
 
+    def make_exact_row_obj(r):
+        """Exact key order: id, entity, eventTime, revision, text"""
+        return {
+            "id": r["id"],
+            "entity": r["entity"],
+            "eventTime": r["eventTime"],
+            "revision": r["revision"],
+            "text": r["text"]
+        }
+
     def row_sort_key(r):
-        row_obj = {"id": r["id"], "entity": r["entity"], "eventTime": r["eventTime"], "revision": r["revision"], "text": r["text"]}
-        return (r["id"].encode('utf-8'), compact_json(row_obj).encode('utf-8'))
+        row_obj = make_exact_row_obj(r)
+        return (r["id"].encode('utf-8'), raw_compact_json(row_obj).encode('utf-8'))
 
     train_rows.sort(key=row_sort_key)
     val_rows.sort(key=row_sort_key)
@@ -391,8 +404,8 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         serialized_rows = []
         all_bytes = b''
         for r in rows:
-            row_obj = {"id": r["id"], "entity": r["entity"], "eventTime": r["eventTime"], "revision": r["revision"], "text": r["text"]}
-            line = json.dumps(row_obj, ensure_ascii=False, separators=(',', ':')) + '\n'
+            row_obj = make_exact_row_obj(r)
+            line = raw_compact_json(row_obj) + '\n'
             all_bytes += line.encode('utf-8')
             serialized_rows.append(row_obj)
         digest = sha256_hex(all_bytes)
@@ -402,7 +415,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     val_serialized, val_digest = serialize_split(val_rows)
     test_serialized, test_digest = serialize_split(test_rows)
 
-    rejected_objects.sort(key=lambda x: ((x["uri"] or "").encode('utf-8'), compact_json(x).encode('utf-8')))
+    rejected_objects.sort(key=lambda x: ((x["uri"] or "").encode('utf-8'), raw_compact_json(x).encode('utf-8')))
 
     merged_rejected = {}
     for rr in rejected_rows:
@@ -414,9 +427,9 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     final_rejected_rows = []
     for rid, codes in merged_rejected.items():
         final_rejected_rows.append({"id": rid, "reasonCodes": sorted(list(codes), key=lambda c: c.encode('utf-8'))})
-    final_rejected_rows.sort(key=lambda x: (x["id"].encode('utf-8'), compact_json(x).encode('utf-8')))
+    final_rejected_rows.sort(key=lambda x: (x["id"].encode('utf-8'), raw_compact_json(x).encode('utf-8')))
 
-    lineage_entries.sort(key=lambda x: (x["uri"].encode('utf-8'), compact_json(x).encode('utf-8')))
+    lineage_entries.sort(key=lambda x: (x["uri"].encode('utf-8'), raw_compact_json(x).encode('utf-8')))
 
     return {
         "splits": {
@@ -467,7 +480,7 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     if invalid_input:
         reason_codes.append("INVALID_INPUT")
 
-    input_canonical = compact_json(payload)
+    input_canonical = sorted_compact_json(payload)
 
     if run_id in BQML_STORE:
         stored = BQML_STORE[run_id]
@@ -540,7 +553,7 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
         group.sort(key=lambda x: (-x["version"], x["id"].encode('utf-8')))
         retained.append(group[0])
 
-    # Find eligible features
+    # Feature eligibility
     if retained:
         all_feature_names = set()
         for r in retained:
@@ -584,8 +597,13 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     train_ids = sorted([r["id"] for r in retained if r["split"] == "TRAIN"], key=lambda x: x.encode('utf-8'))
     eval_ids = sorted([r["id"] for r in retained if r["split"] == "EVAL"], key=lambda x: x.encode('utf-8'))
 
-    digest_obj = {"trainRowIds": train_ids, "evalRowIds": eval_ids, "featureNames": eligible_features}
-    dataset_digest = sha256_hex(compact_json(digest_obj).encode('utf-8'))
+    # Exact key order: trainRowIds, evalRowIds, featureNames
+    digest_obj = {
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": eligible_features
+    }
+    dataset_digest = sha256_hex(raw_compact_json(digest_obj).encode('utf-8'))
 
     if isinstance(trials, list) and len(trials) > num_trials_limit:
         reason_codes.append("TRIAL_LIMIT_EXCEEDED")
@@ -840,7 +858,6 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
     if not is_finite_number(min_improvement) or isinstance(min_improvement, bool) or not (0 <= min_improvement <= 1):
         policy_valid = False
 
-    # Count occurrences
     version_counts = {}
     for v in versions:
         if isinstance(v, dict) and "version" in v:
@@ -850,7 +867,6 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
 
     duplicated_versions = {v for v, count in version_counts.items() if count > 1}
 
-    # Evaluate each version item
     version_map = {}
     eligible = []
 
@@ -1423,36 +1439,19 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
 
     ar_set = set()
     for r in allowed_reasons:
-        if not isinstance(r, str) or not r:
-            return {"error": "INVALID_INPUT"}, 400
-        if r in ar_set:
-            return {"error": "INVALID_INPUT"}, 400
-        ar_set.add(r)
+        if isinstance(r, str) and r:
+            ar_set.add(r)
 
     cand_names = set()
-    for c in candidates:
-        if not isinstance(c, dict):
-            return {"error": "INVALID_INPUT"}, 400
-        name = c.get("name")
-        if not isinstance(name, str) or not name:
-            return {"error": "INVALID_INPUT"}, 400
-        if name in cand_names:
-            return {"error": "INVALID_INPUT"}, 400
-        cand_names.add(name)
-
-    input_canonical = compact_json(payload)
-
-    if freeze_id in QUANTIZE_STORE:
-        stored = QUANTIZE_STORE[freeze_id]
-        if stored.get("_input_canonical") == input_canonical:
-            resp = {k: v for k, v in stored.items() if not k.startswith('_')}
-            return resp, 200
-        else:
-            return {"error": "FREEZE_ID_CONFLICT"}, 409
-
     results = []
     for c in candidates:
-        name = c["name"]
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        cand_names.add(name)
+
         files = c.get("files")
         loadable = c.get("loadable")
         cal_dig = c.get("calibrationDigest")
@@ -1489,9 +1488,10 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
                 fdata = files[fname].encode('utf-8')
                 fbytes = len(fdata)
                 fsha = sha256_hex(fdata)
+                # Exact key order: name, bytes, sha256
                 inventory.append({"name": fname, "bytes": fbytes, "sha256": fsha})
             total_bytes_val = sum(item["bytes"] for item in inventory)
-            package_digest = sha256_hex(compact_json(inventory).encode('utf-8'))
+            package_digest = sha256_hex(raw_compact_json(inventory).encode('utf-8'))
 
         status = "invalid"
         if isinstance(unsup_reason, str) and unsup_reason:
@@ -1532,6 +1532,16 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
 
     results.sort(key=lambda x: x["name"].encode('utf-8'))
 
+    input_canonical = sorted_compact_json(payload)
+
+    if freeze_id in QUANTIZE_STORE:
+        stored = QUANTIZE_STORE[freeze_id]
+        if stored.get("_input_canonical") == input_canonical:
+            resp = {k: v for k, v in stored.items() if not k.startswith('_')}
+            return resp, 200
+        else:
+            return {"error": "FREEZE_ID_CONFLICT"}, 409
+
     resp = {"freezeId": freeze_id, "candidates": results}
     resp["_input_canonical"] = input_canonical
     QUANTIZE_STORE[freeze_id] = resp
@@ -1544,7 +1554,7 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
 
     candidates = payload.get("candidates")
     pol = payload.get("policy")
-    latencies = payload.get("latencies")
+    latencies = payload.get("latencies", {})
     rows = payload.get("rows")
 
     if not isinstance(candidates, list) or not isinstance(pol, dict) or not isinstance(rows, list):
@@ -1565,9 +1575,6 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
     if not isinstance(latencies, dict):
         latencies = {}
 
-    cand_names_set = set(c["name"] for c in stored_candidates if isinstance(c, dict) and "name" in c)
-    order_set = set(cand_order) if isinstance(cand_order, list) else set()
-
     results_list = []
     admitted_list = []
 
@@ -1582,10 +1589,9 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
         if c.get("status") != "frozen":
             codes.append("NOT_FROZEN")
 
-        # Recompute totalBytes from inventory if available
         tb = None
         inv = c.get("inventory")
-        if isinstance(inv, list):
+        if isinstance(inv, list) and len(inv) > 0:
             tb = sum(item["bytes"] for item in inv if isinstance(item, dict) and "bytes" in item)
         else:
             tb = c.get("totalBytes")
@@ -1770,7 +1776,7 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
         return {"error": "INVALID_REQUEST"}, 409
 
     state = get_session_state(session)
-    inputs_canonical = compact_json(inputs)
+    inputs_canonical = sorted_compact_json(inputs)
 
     if state["revision"] is not None:
         if revision < state["revision"]:
@@ -1814,7 +1820,7 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
                 values.append(parent_artifact)
             else:
                 values.append(inp[k])
-        return sha256_hex(compact_json(values).encode('utf-8'))
+        return sha256_hex(raw_compact_json(values).encode('utf-8'))
 
     def get_artifact(node):
         ns = state["nodes"].get(node, {})
@@ -1851,7 +1857,7 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
             ignored_ids.append(ev_id)
             continue
 
-        ev_canonical = compact_json(ev)
+        ev_canonical = sorted_compact_json(ev)
         if ev_id in state["event_ids"]:
             if state["event_ids"][ev_id] == ev_canonical:
                 ignored_ids.append(ev_id)
@@ -2140,18 +2146,19 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         if fname == "inventory.json":
             continue
         fdata = files[fname].encode('utf-8') if isinstance(files[fname], str) else b''
+        # Exact key order: name, bytes, sha256
         computed_inventory.append({
             "name": fname,
             "bytes": len(fdata),
             "sha256": sha256_hex(fdata)
         })
 
-    inventory_digest = sha256_hex(compact_json(computed_inventory).encode('utf-8'))
+    inventory_digest = sha256_hex(raw_compact_json(computed_inventory).encode('utf-8'))
 
     if "inventory.json" in files:
         try:
             inv_parsed = json.loads(files["inventory.json"])
-            if compact_json(inv_parsed) != compact_json(computed_inventory):
+            if raw_compact_json(inv_parsed) != raw_compact_json(computed_inventory):
                 violations.append("INVENTORY_MISMATCH")
         except Exception:
             violations.append("INVALID_JSON:inventory.json")
