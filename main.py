@@ -1,11 +1,12 @@
 import html
 import re
 import urllib.parse
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="TDS GA7 Policy Gate Service")
+app = FastAPI(title="TDS GA7 Policy Gate & Corroboration Engine")
 
 # =============================================================================
 # Question 1: Release Gate (POST /release-gate)
@@ -28,25 +29,21 @@ def evaluate_release_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(image, dict):
         image = {}
 
-    # 1. Permissions rule: EXCESS_PERMISSION
     permissions = workflow.get("permissions")
     expected_permissions = {"contents": "read", "packages": "write", "id-token": "none"}
     if not isinstance(permissions, dict) or permissions != expected_permissions:
         violations.append("EXCESS_PERMISSION")
 
-    # 2. Trigger & PR rule: UNSAFE_PR_TRIGGER
     wf_trigger = workflow.get("trigger")
     if wf_trigger == "pull_request_target" or event == "pull_request_target":
         violations.append("UNSAFE_PR_TRIGGER")
 
-    # 3. Tests & Matrix rule: TESTS_INCOMPLETE
     tests_passed = workflow.get("testsPassed")
     matrix_complete = workflow.get("matrixComplete")
     fail_fast = workflow.get("failFast")
     if tests_passed is not True or matrix_complete is not True or fail_fast is not False:
         violations.append("TESTS_INCOMPLETE")
 
-    # 4. Action Pinning rule: MUTABLE_ACTION
     actions = workflow.get("actions")
     has_mutable_action = False
     if isinstance(actions, list):
@@ -70,32 +67,26 @@ def evaluate_release_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if has_mutable_action:
         violations.append("MUTABLE_ACTION")
 
-    # 5. Multi-stage image rule: SINGLE_STAGE_IMAGE
     multi_stage = image.get("multiStage")
     if multi_stage is not True:
         violations.append("SINGLE_STAGE_IMAGE")
 
-    # 6. Root runtime rule: ROOT_RUNTIME
     runs_as_root = image.get("runsAsRoot")
     if runs_as_root is not False:
         violations.append("ROOT_RUNTIME")
 
-    # 7. Secret mode rule: SECRET_IN_LAYER
     secret_mode = image.get("secretMode")
     if secret_mode not in ["none", "buildkit"]:
         violations.append("SECRET_IN_LAYER")
 
-    # 8. Critical vulnerabilities rule: CRITICAL_CVE
     crit_cves = image.get("criticalVulnerabilities")
     if crit_cves != 0:
         violations.append("CRITICAL_CVE")
 
-    # 9. Digest pinned rule: UNPINNED_IMAGE
     digest_pinned = image.get("digestPinned")
     if digest_pinned is not True:
         violations.append("UNPINNED_IMAGE")
 
-    # 10 & 11. Production target rules
     if target == "production":
         if ref != "refs/heads/main" or event != "push":
             violations.append("INVALID_PRODUCTION_REF")
@@ -565,7 +556,6 @@ def evaluate_sanitize_output(payload: Dict[str, Any]) -> Dict[str, Any]:
         "reason": final_reason
     }
 
-@app.post("/")
 @app.post("/sanitize-output")
 @app.post("/sanitize-output/")
 @app.post("/sanitize-output/sanitize-output")
@@ -576,6 +566,157 @@ async def sanitize_output_endpoint(request: Request):
         payload = {}
     
     result = evaluate_sanitize_output(payload)
+    return JSONResponse(content=result)
+
+
+# =============================================================================
+# Question 5: OSINT Corroboration Engine (POST /corroborate)
+# =============================================================================
+
+VALID_SOURCE_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
+
+def parse_iso_datetime(dt_str: str) -> Optional[datetime]:
+    if not isinstance(dt_str, str):
+        return None
+    try:
+        s = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def is_valid_source(src: Any) -> bool:
+    if not isinstance(src, dict):
+        return False
+    
+    src_id = src.get("id")
+    origin = src.get("origin")
+    val = src.get("value")
+    obs_at = src.get("observedAt")
+    stype = src.get("type")
+    
+    if not isinstance(src_id, str) or not isinstance(origin, str) or not isinstance(val, str) or not isinstance(obs_at, str):
+        return False
+    
+    if stype not in VALID_SOURCE_TYPES:
+        return False
+
+    if parse_iso_datetime(obs_at) is None:
+        return False
+
+    auth = src.get("authoritative", False)
+    if not isinstance(auth, bool):
+        return False
+
+    return True
+
+def evaluate_corroborate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Rule 1: invalid
+    # the body is not an object, claim.value is not a string, asOf is missing or unparseable, stalenessDays is not a number, or sources is not an array.
+    if not isinstance(payload, dict):
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    claim = payload.get("claim")
+    if not isinstance(claim, dict):
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    claim_val = claim.get("value")
+    if not isinstance(claim_val, str):
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    as_of_str = payload.get("asOf")
+    as_of_dt = parse_iso_datetime(as_of_str)
+    if as_of_dt is None:
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    staleness_days = payload.get("stalenessDays")
+    if not isinstance(staleness_days, (int, float)) or isinstance(staleness_days, bool) or staleness_days < 0:
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    # Filter valid sources
+    valid_sources = [s for s in sources if is_valid_source(s)]
+
+    # Freshness helper: asOf - observedAt <= stalenessDays (and observedAt <= asOf)
+    max_stale_sec = staleness_days * 86400.0
+
+    def is_fresh(src: Dict[str, Any]) -> bool:
+        obs_dt = parse_iso_datetime(src["observedAt"])
+        if obs_dt is None:
+            return False
+        delta_sec = (as_of_dt - obs_dt).total_seconds()
+        return 0 <= delta_sec <= max_stale_sec
+
+    # Rule 2: contradicted
+    # at least one fresh source with authoritative: true reports a value different from the claim.
+    # Confidence low. corroboratingSources = the ids of those contradicting sources, sorted ascending.
+    contradicting_sources = [
+        s for s in valid_sources
+        if is_fresh(s) and s.get("authoritative") is True and s["value"] != claim_val
+    ]
+
+    if len(contradicting_sources) > 0:
+        contradicting_ids = sorted(list(set(s["id"] for s in contradicting_sources)))
+        return {
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": contradicting_ids
+        }
+
+    # Rule 3: supported
+    # after keeping only fresh sources whose value equals the claim, and reducing them to one representative per origin
+    # (the representative is the source with the lexicographically smallest id for that origin), two or more representatives remain.
+    matching_fresh_sources = [
+        s for s in valid_sources
+        if is_fresh(s) and s["value"] == claim_val
+    ]
+
+    # Group by origin
+    origin_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for s in matching_fresh_sources:
+        orig = s["origin"]
+        if orig not in origin_groups:
+            origin_groups[orig] = []
+        origin_groups[orig].append(s)
+
+    # Find representative for each origin (lexicographically smallest id)
+    representatives: List[Dict[str, Any]] = []
+    for orig, group in origin_groups.items():
+        rep = min(group, key=lambda x: x["id"])
+        representatives.append(rep)
+
+    if len(representatives) >= 2:
+        distinct_types = set(r["type"] for r in representatives)
+        confidence = "high" if len(distinct_types) >= 2 else "medium"
+        rep_ids = sorted([r["id"] for r in representatives])
+        return {
+            "verdict": "supported",
+            "confidence": confidence,
+            "corroboratingSources": rep_ids
+        }
+
+    # Rule 4: unverified
+    return {
+        "verdict": "unverified",
+        "confidence": "low",
+        "corroboratingSources": []
+    }
+
+@app.post("/corroborate")
+@app.post("/corroborate/")
+@app.post("/corroborate/corroborate")
+async def corroborate_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    
+    result = evaluate_corroborate(payload)
     return JSONResponse(content=result)
 
 if __name__ == "__main__":

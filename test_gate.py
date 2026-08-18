@@ -1,5 +1,11 @@
 import unittest
-from main import evaluate_release_gate, evaluate_action_firewall, evaluate_terraform_plan, evaluate_sanitize_output
+from main import (
+    evaluate_release_gate,
+    evaluate_action_firewall,
+    evaluate_terraform_plan,
+    evaluate_sanitize_output,
+    evaluate_corroborate
+)
 
 def get_base_preview_payload():
     return {
@@ -495,6 +501,106 @@ class TestSanitizeOutput(unittest.TestCase):
     def test_shell_metachar_command_sub(self):
         res = evaluate_sanitize_output({"channel": "shell", "output": "echo $(id)"})
         self.assertEqual(res, {"safe": False, "reason": "SHELL_METACHAR"})
+
+
+class TestCorroborationEngine(unittest.TestCase):
+    def get_base_corroborate_payload(self):
+        return {
+            "claim": {"subject": "959hsd.example", "predicate": "resolves_to", "value": "203.0.113.20"},
+            "asOf": "2026-08-01T00:00:00Z",
+            "stalenessDays": 90,
+            "sources": [
+                {"id": "s1", "type": "dns", "origin": "resolver-a", "observedAt": "2026-07-30T00:00:00Z", "value": "203.0.113.20", "authoritative": False},
+                {"id": "s2", "type": "ct_log", "origin": "log-b", "observedAt": "2026-07-29T00:00:00Z", "value": "203.0.113.20", "authoritative": False}
+            ]
+        }
+
+    def test_supported_high_confidence(self):
+        p = self.get_base_corroborate_payload()
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "supported",
+            "confidence": "high",
+            "corroboratingSources": ["s1", "s2"]
+        })
+
+    def test_supported_medium_confidence(self):
+        p = self.get_base_corroborate_payload()
+        p["sources"][1]["type"] = "dns"  # same type as s1
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "supported",
+            "confidence": "medium",
+            "corroboratingSources": ["s1", "s2"]
+        })
+
+    def test_origin_mirror_deduplication(self):
+        p = self.get_base_corroborate_payload()
+        # s2 shares origin with s1 (resolver-a), s3 has origin resolver-a
+        p["sources"].append({
+            "id": "s0", "type": "scan", "origin": "resolver-a", "observedAt": "2026-07-30T00:00:00Z", "value": "203.0.113.20", "authoritative": False
+        })
+        # Representative for resolver-a will be s0 (smallest id)
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "supported",
+            "confidence": "high",
+            "corroboratingSources": ["s0", "s2"]
+        })
+
+    def test_contradicted_authoritative(self):
+        p = self.get_base_corroborate_payload()
+        p["sources"].append({
+            "id": "s99", "type": "dns", "origin": "auth-ns", "observedAt": "2026-07-31T00:00:00Z", "value": "198.51.100.5", "authoritative": True
+        })
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": ["s99"]
+        })
+
+    def test_stale_authoritative_does_not_contradict(self):
+        p = self.get_base_corroborate_payload()
+        p["sources"].append({
+            "id": "s99", "type": "dns", "origin": "auth-ns", "observedAt": "2026-01-01T00:00:00Z", "value": "198.51.100.5", "authoritative": True
+        })
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "supported",
+            "confidence": "high",
+            "corroboratingSources": ["s1", "s2"]
+        })
+
+    def test_unverified_single_source(self):
+        p = self.get_base_corroborate_payload()
+        p["sources"] = [p["sources"][0]]
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "unverified",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    def test_invalid_schema_asof(self):
+        p = self.get_base_corroborate_payload()
+        p["asOf"] = "invalid-date"
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    def test_invalid_schema_staleness_days(self):
+        p = self.get_base_corroborate_payload()
+        p["stalenessDays"] = -5
+        res = evaluate_corroborate(p)
+        self.assertEqual(res, {
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
 
 
 if __name__ == "__main__":
