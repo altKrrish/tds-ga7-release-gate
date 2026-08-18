@@ -719,6 +719,98 @@ async def corroborate_endpoint(request: Request):
     result = evaluate_corroborate(payload)
     return JSONResponse(content=result)
 
+
+# =============================================================================
+# Set 2 Endpoints (Questions 1-7)
+# =============================================================================
+from endpoints_set2 import (
+    evaluate_build_corpus,
+    evaluate_bqml,
+    evaluate_promote,
+    evaluate_adapt,
+    evaluate_quantize,
+    evaluate_pipeline,
+    evaluate_verify_bundle
+)
+
+@app.post("/build-corpus")
+@app.post("/build-corpus/")
+@app.post("/build-corpus/build-corpus")
+async def build_corpus_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_build_corpus(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/bqml")
+@app.post("/bqml/")
+@app.post("/bqml/bqml")
+async def bqml_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_bqml(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/promote")
+@app.post("/promote/")
+@app.post("/promote/promote")
+async def promote_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_promote(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/adapt")
+@app.post("/adapt/")
+@app.post("/adapt/adapt")
+async def adapt_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_adapt(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/quantize")
+@app.post("/quantize/")
+@app.post("/quantize/quantize")
+async def quantize_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_quantize(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/pipeline")
+@app.post("/pipeline/")
+@app.post("/pipeline/pipeline")
+async def pipeline_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_pipeline(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/verify-bundle")
+@app.post("/verify-bundle/")
+@app.post("/verify-bundle/verify-bundle")
+async def verify_bundle_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    result, status_code = evaluate_verify_bundle(payload)
+    return JSONResponse(content=result, status_code=status_code)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
