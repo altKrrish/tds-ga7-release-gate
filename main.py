@@ -1,4 +1,6 @@
+import html
 import re
+import urllib.parse
 from typing import Any, Dict, List
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -129,18 +131,15 @@ async def release_gate_endpoint(request: Request):
 ASSIGNED_TENANT = "tenant-75q9eyt"
 ASSIGNED_EMAIL_DOMAIN = "notify-869x73c.example"
 
-def is_unsafe_html(html: str) -> bool:
-    html_lower = html.lower()
+def is_unsafe_html(html_str: str) -> bool:
+    html_lower = html_str.lower()
     
-    # 1. Check for <script> and <iframe> tags
     if re.search(r"<\s*/?\s*(script|iframe)\b", html_lower):
         return True
 
-    # 2. Check for inline event handlers: on<event>= (e.g. onload=, onerror=, onclick=)
     if re.search(r"\bon[a-z]+\s*=", html_lower):
         return True
 
-    # 3. Check for javascript: URLs
     if re.search(r"java\s*script\s*:", html_lower):
         return True
 
@@ -151,7 +150,6 @@ def is_unsafe_html(html: str) -> bool:
     return False
 
 def evaluate_action_firewall(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Check 1: Top-level schema check (INVALID_SCHEMA)
     if not isinstance(payload, dict):
         return {"decision": "block", "reason": "INVALID_SCHEMA"}
 
@@ -184,12 +182,10 @@ def evaluate_action_firewall(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(args, dict):
         return {"decision": "block", "reason": "INVALID_SCHEMA"}
 
-    # Check 2: Tool allowlist check (TOOL_NOT_ALLOWED)
     allowed_tools = {"search", "lookup_record", "send_email", "render_html"}
     if tool not in allowed_tools:
         return {"decision": "block", "reason": "TOOL_NOT_ALLOWED"}
 
-    # Check 3: Selected tool's argument schema (INVALID_SCHEMA)
     if tool == "search":
         if set(args.keys()) != {"query"}:
             return {"decision": "block", "reason": "INVALID_SCHEMA"}
@@ -221,12 +217,10 @@ def evaluate_action_firewall(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(html_content, str):
             return {"decision": "block", "reason": "INVALID_SCHEMA"}
 
-    # Check 4: Tenant scope (TENANT_SCOPE)
     if tool == "lookup_record":
         if args["tenantId"] != ASSIGNED_TENANT:
             return {"decision": "block", "reason": "TENANT_SCOPE"}
 
-    # Check 5: Email domain check (EGRESS_DENIED)
     if tool == "send_email":
         to_str = args["to"].strip()
         if "@" in to_str:
@@ -236,17 +230,14 @@ def evaluate_action_firewall(payload: Dict[str, Any]) -> Dict[str, Any]:
         if domain != ASSIGNED_EMAIL_DOMAIN.lower():
             return {"decision": "block", "reason": "EGRESS_DENIED"}
 
-    # Check 6: Human approval check (APPROVAL_REQUIRED)
     if tool == "send_email":
         if not human_approved:
             return {"decision": "block", "reason": "APPROVAL_REQUIRED"}
 
-    # Check 7: HTML safety check (UNSAFE_OUTPUT)
     if tool == "render_html":
         if is_unsafe_html(args["html"]):
             return {"decision": "block", "reason": "UNSAFE_OUTPUT"}
 
-    # If no rule fails -> ALLOW
     return {"decision": "allow", "reason": "ALLOW"}
 
 @app.post("/action-firewall")
@@ -300,7 +291,6 @@ def is_provider_pinned(pv_str: str) -> bool:
     return False
 
 def evaluate_terraform_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Check 1: Top-level and nested value types (INVALID_PLAN)
     if not isinstance(payload, dict):
         return {"decision": "reject", "reason": "INVALID_PLAN"}
 
@@ -364,43 +354,34 @@ def evaluate_terraform_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     if force_destroy is not None and not isinstance(force_destroy, bool):
         return {"decision": "reject", "reason": "INVALID_PLAN"}
 
-    # Check 2: Environment match (ENVIRONMENT_MISMATCH)
     if env != ASSIGNED_WORKSPACE:
         return {"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"}
 
-    # Check 3: State backend & locking (STATE_UNSAFE)
     allowed_backends = {"gcs", "s3", "azurerm", "remote"}
     if backend not in allowed_backends or locked is not True:
         return {"decision": "reject", "reason": "STATE_UNSAFE"}
 
-    # Check 4: Provider pinning (UNPINNED_PROVIDER)
     if not is_provider_pinned(provider_version):
         return {"decision": "reject", "reason": "UNPINNED_PROVIDER"}
 
-    # Check 5: Assigned labels (MISSING_LABELS)
     for req_k, req_v in REQUIRED_LABELS.items():
         if res_labels.get(req_k) != req_v:
             return {"decision": "reject", "reason": "MISSING_LABELS"}
 
-    # Check 6: Plaintext secret (PLAINTEXT_SECRET)
     if res_secret is not None:
         if not (res_secret.startswith("secret://") and len(res_secret) > len("secret://")):
             return {"decision": "reject", "reason": "PLAINTEXT_SECRET"}
 
-    # Check 7: Stateful delete approval (DELETE_NOT_APPROVED)
     stateful_types = ["storage_bucket", "sql_database", "persistent_disk"]
     is_stateful = any(st in res_type for st in stateful_types)
     if res_action == "delete" and is_stateful and destroy_approved is not True:
         return {"decision": "reject", "reason": "DELETE_NOT_APPROVED"}
 
-    # Check 8: Force destroy on storage bucket (FORCE_DESTROY)
     if "storage_bucket" in res_type and force_destroy is True:
         return {"decision": "reject", "reason": "FORCE_DESTROY"}
 
-    # If all rules pass -> APPROVE
     return {"decision": "approve", "reason": "APPROVE"}
 
-@app.post("/")
 @app.post("/terraform/plan")
 @app.post("/terraform/plan/")
 @app.post("/terraform/plan/terraform/plan")
@@ -411,6 +392,190 @@ async def terraform_plan_endpoint(request: Request):
         payload = {}
     
     result = evaluate_terraform_plan(payload)
+    return JSONResponse(content=result)
+
+
+# =============================================================================
+# Question 4: LLM Output Handling Gate (POST /sanitize-output)
+# =============================================================================
+
+ALLOWED_HOSTS_Q4 = {"cdn-i27fuzj.example", "app-5dt5fud.example"}
+
+def extract_urls_q4(channel: str, text: str) -> List[str]:
+    urls = []
+    if channel == "html":
+        matches = re.findall(r"""\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", text, re.IGNORECASE)
+        for m in matches:
+            val = m[0] or m[1] or m[2]
+            if val:
+                urls.append(val.strip())
+    elif channel == "markdown":
+        matches = re.findall(r"\]\(([^)]+)\)", text)
+        for m in matches:
+            target = m.strip()
+            parts = target.split()
+            if parts:
+                urls.append(parts[0].strip())
+    elif channel == "url":
+        urls.append(text.strip())
+    return urls
+
+def check_dangerous_scheme_q4(channel: str, text: str, urls: List[str]) -> bool:
+    if re.search(r"\b(javascript|data|vbscript)\s*:", text, re.IGNORECASE):
+        return True
+
+    for u in urls:
+        raw_u = u.strip()
+        if raw_u.startswith("//"):
+            raw_u = "https:" + raw_u
+        
+        parsed = urllib.parse.urlparse(raw_u)
+        scheme = parsed.scheme.lower()
+        if scheme:
+            if scheme not in ["http", "https"]:
+                return True
+
+    return False
+
+def check_external_exfil_q4(urls: List[str]) -> bool:
+    for u in urls:
+        raw_u = u.strip()
+        if not raw_u:
+            continue
+        
+        is_protocol_relative = raw_u.startswith("//")
+        if is_protocol_relative:
+            raw_u = "https:" + raw_u
+            
+        parsed = urllib.parse.urlparse(raw_u)
+        scheme = parsed.scheme.lower()
+        
+        is_absolute = is_protocol_relative or bool(scheme) or bool(parsed.netloc) or raw_u.startswith("http://") or raw_u.startswith("https://")
+        
+        if is_absolute:
+            hostname = parsed.hostname
+            if not hostname:
+                return True
+            
+            if hostname.lower() not in ALLOWED_HOSTS_Q4:
+                return True
+    return False
+
+def evaluate_channel_rules_q4(channel: str, text: str) -> str:
+    if channel == "html":
+        if re.search(r"<\s*(script|iframe|object|embed)\b", text, re.IGNORECASE):
+            return "SCRIPT_TAG"
+
+        if re.search(r"\bon[a-z0-9_-]+\s*=", text, re.IGNORECASE):
+            return "EVENT_HANDLER"
+
+        urls = extract_urls_q4("html", text)
+
+        if check_dangerous_scheme_q4("html", text, urls):
+            return "DANGEROUS_SCHEME"
+
+        if check_external_exfil_q4(urls):
+            return "EXTERNAL_EXFIL"
+
+    elif channel == "markdown":
+        urls = extract_urls_q4("markdown", text)
+
+        if check_dangerous_scheme_q4("markdown", text, urls):
+            return "DANGEROUS_SCHEME"
+
+        if check_external_exfil_q4(urls):
+            return "EXTERNAL_EXFIL"
+
+    elif channel == "url":
+        urls = extract_urls_q4("url", text)
+
+        if check_dangerous_scheme_q4("url", text, urls):
+            return "DANGEROUS_SCHEME"
+
+        if check_external_exfil_q4(urls):
+            return "EXTERNAL_EXFIL"
+
+    elif channel == "sql":
+        if "'" in text or '"' in text or ";" in text or "--" in text or "/*" in text:
+            return "SQL_METACHAR"
+        if re.search(r"\bunion\b", text, re.IGNORECASE):
+            return "SQL_METACHAR"
+        if re.search(r"\bor\s+1\s*=\s*1\b", text, re.IGNORECASE):
+            return "SQL_METACHAR"
+
+    elif channel == "shell":
+        shell_metachars = [";", "&", "|", "`", "<", ">", "$(", "${"]
+        if any(c in text for c in shell_metachars):
+            return "SHELL_METACHAR"
+
+    return "SAFE"
+
+def decode_output_q4(text: str) -> str:
+    s = text
+    try:
+        s = urllib.parse.unquote(s)
+    except Exception:
+        pass
+
+    try:
+        s = html.unescape(s)
+    except Exception:
+        pass
+
+    def unescape_unicode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+
+    s = re.sub(r"\\u([0-9a-fA-F]{4})", unescape_unicode, s)
+    return s
+
+def evaluate_sanitize_output(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"safe": False, "reason": "INVALID_SCHEMA"}
+
+    if "channel" not in payload or "output" not in payload:
+        return {"safe": False, "reason": "INVALID_SCHEMA"}
+
+    channel = payload["channel"]
+    output = payload["output"]
+
+    if not isinstance(channel, str) or not isinstance(output, str):
+        return {"safe": False, "reason": "INVALID_SCHEMA"}
+
+    allowed_channels = {"html", "markdown", "url", "sql", "shell"}
+    if channel not in allowed_channels:
+        return {"safe": False, "reason": "INVALID_SCHEMA"}
+
+    if len(output) > 20000:
+        return {"safe": False, "reason": "INVALID_SCHEMA"}
+
+    decoded = decode_output_q4(output)
+    if decoded != output:
+        decoded_reason = evaluate_channel_rules_q4(channel, decoded)
+        if decoded_reason != "SAFE":
+            return {"safe": False, "reason": "ENCODED_PAYLOAD"}
+
+    final_reason = evaluate_channel_rules_q4(channel, output)
+    is_safe = (final_reason == "SAFE")
+
+    return {
+        "safe": is_safe,
+        "reason": final_reason
+    }
+
+@app.post("/")
+@app.post("/sanitize-output")
+@app.post("/sanitize-output/")
+@app.post("/sanitize-output/sanitize-output")
+async def sanitize_output_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    
+    result = evaluate_sanitize_output(payload)
     return JSONResponse(content=result)
 
 if __name__ == "__main__":

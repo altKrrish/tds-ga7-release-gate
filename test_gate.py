@@ -1,5 +1,5 @@
 import unittest
-from main import evaluate_release_gate, evaluate_action_firewall, evaluate_terraform_plan
+from main import evaluate_release_gate, evaluate_action_firewall, evaluate_terraform_plan, evaluate_sanitize_output
 
 def get_base_preview_payload():
     return {
@@ -413,6 +413,88 @@ class TestTerraformPlanPolicy(unittest.TestCase):
         p["resource"]["forceDestroy"] = True
         res = evaluate_terraform_plan(p)
         self.assertEqual(res, {"decision": "reject", "reason": "FORCE_DESTROY"})
+
+
+class TestSanitizeOutput(unittest.TestCase):
+    def test_safe_html(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "<p>Hello <a href='https://app-5dt5fud.example/page'>Link</a></p>"})
+        self.assertEqual(res, {"safe": True, "reason": "SAFE"})
+
+    def test_safe_markdown(self):
+        res = evaluate_sanitize_output({"channel": "markdown", "output": "Check this ![img](https://cdn-i27fuzj.example/pic.png)"})
+        self.assertEqual(res, {"safe": True, "reason": "SAFE"})
+
+    def test_safe_url(self):
+        res = evaluate_sanitize_output({"channel": "url", "output": "https://cdn-i27fuzj.example/resource"})
+        self.assertEqual(res, {"safe": True, "reason": "SAFE"})
+
+    def test_safe_sql(self):
+        res = evaluate_sanitize_output({"channel": "sql", "output": "SELECT id, name FROM users WHERE age > 21"})
+        self.assertEqual(res, {"safe": True, "reason": "SAFE"})
+
+    def test_safe_shell(self):
+        res = evaluate_sanitize_output({"channel": "shell", "output": "echo 'Hello World'"})
+        self.assertEqual(res, {"safe": True, "reason": "SAFE"})
+
+    def test_invalid_schema_channel(self):
+        res = evaluate_sanitize_output({"channel": "exec", "output": "test"})
+        self.assertEqual(res, {"safe": False, "reason": "INVALID_SCHEMA"})
+
+    def test_invalid_schema_length(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "a" * 20001})
+        self.assertEqual(res, {"safe": False, "reason": "INVALID_SCHEMA"})
+
+    def test_encoded_payload_script(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "%3Cscript%3Ealert(1)%3C/script%3E"})
+        self.assertEqual(res, {"safe": False, "reason": "ENCODED_PAYLOAD"})
+
+    def test_encoded_payload_unicode(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"})
+        self.assertEqual(res, {"safe": False, "reason": "ENCODED_PAYLOAD"})
+
+    def test_script_tag(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "<script src='x.js'></script>"})
+        self.assertEqual(res, {"safe": False, "reason": "SCRIPT_TAG"})
+
+    def test_iframe_tag(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "<iframe src='https://cdn-i27fuzj.example'></iframe>"})
+        self.assertEqual(res, {"safe": False, "reason": "SCRIPT_TAG"})
+
+    def test_event_handler(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "<img src='https://cdn-i27fuzj.example/img.png' onload='alert(1)'>"})
+        self.assertEqual(res, {"safe": False, "reason": "EVENT_HANDLER"})
+
+    def test_dangerous_scheme_javascript(self):
+        res = evaluate_sanitize_output({"channel": "html", "output": "<a href='javascript:alert(1)'>Click</a>"})
+        self.assertEqual(res, {"safe": False, "reason": "DANGEROUS_SCHEME"})
+
+    def test_dangerous_scheme_data(self):
+        res = evaluate_sanitize_output({"channel": "markdown", "output": "[click](data:text/html,xss)"})
+        self.assertEqual(res, {"safe": False, "reason": "DANGEROUS_SCHEME"})
+
+    def test_external_exfil_subdomain(self):
+        res = evaluate_sanitize_output({"channel": "markdown", "output": "![img](https://sub.cdn-i27fuzj.example/pic.png)"})
+        self.assertEqual(res, {"safe": False, "reason": "EXTERNAL_EXFIL"})
+
+    def test_external_exfil_unallowed_host(self):
+        res = evaluate_sanitize_output({"channel": "url", "output": "https://attacker.example/path"})
+        self.assertEqual(res, {"safe": False, "reason": "EXTERNAL_EXFIL"})
+
+    def test_sql_metachar_quote(self):
+        res = evaluate_sanitize_output({"channel": "sql", "output": "SELECT * FROM users WHERE name = 'admin'"})
+        self.assertEqual(res, {"safe": False, "reason": "SQL_METACHAR"})
+
+    def test_sql_metachar_union(self):
+        res = evaluate_sanitize_output({"channel": "sql", "output": "SELECT 1 UNION SELECT 2"})
+        self.assertEqual(res, {"safe": False, "reason": "SQL_METACHAR"})
+
+    def test_shell_metachar_semicolon(self):
+        res = evaluate_sanitize_output({"channel": "shell", "output": "ls; rm -rf /"})
+        self.assertEqual(res, {"safe": False, "reason": "SHELL_METACHAR"})
+
+    def test_shell_metachar_command_sub(self):
+        res = evaluate_sanitize_output({"channel": "shell", "output": "echo $(id)"})
+        self.assertEqual(res, {"safe": False, "reason": "SHELL_METACHAR"})
 
 
 if __name__ == "__main__":
