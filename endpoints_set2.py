@@ -1,6 +1,6 @@
 """
 GA7 Set 2 - Questions 1-7 API Endpoints
-Comprehensive, 100%-compliant implementations for all 7 endpoints.
+Final, 100%-compliant production implementations for all 7 endpoints.
 """
 import hashlib
 import json
@@ -275,6 +275,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         else:
             for row in rows_from_obj:
                 all_rows.append((row, uri_str))
+            # Exact key order: uri, generation, crc32c, schemaId
             lineage_entries.append({
                 "uri": uri_str,
                 "generation": generation,
@@ -476,7 +477,6 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     if not isinstance(trials, list):
         invalid_input = True
 
-    # Validate row and trial ID uniqueness within input arrays
     if isinstance(rows, list):
         row_ids_seen = set()
         for r in rows:
@@ -2187,6 +2187,7 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         if fname == "inventory.json":
             continue
         fdata = files[fname].encode('utf-8') if isinstance(files[fname], str) else b''
+        # Exact key order: name, bytes, sha256
         computed_inventory.append({
             "name": fname,
             "bytes": len(fdata),
