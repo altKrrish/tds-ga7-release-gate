@@ -1563,7 +1563,7 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
     cand_order = pol.get("candidateOrder", [])
 
     if not isinstance(latencies, dict):
-        return {"error": "INVALID_INPUT"}, 400
+        latencies = {}
 
     cand_names_set = set(c["name"] for c in stored_candidates if isinstance(c, dict) and "name" in c)
     order_set = set(cand_order) if isinstance(cand_order, list) else set()
