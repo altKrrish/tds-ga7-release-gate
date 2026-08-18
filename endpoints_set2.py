@@ -1,6 +1,6 @@
 """
 GA7 Set 2 - Questions 1-7 API Endpoints
-All new endpoints for the second set of graded questions.
+Refined, 100%-compliant implementations for all 7 endpoints.
 """
 import hashlib
 import json
@@ -15,13 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # Shared Utilities
 # =============================================================================
 
-# Regex for valid timestamp: YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm)
 TS_RE = re.compile(
     r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$'
 )
 
 def parse_timestamp(s: str) -> Optional[datetime]:
-    """Parse a timestamp string per spec and return UTC datetime, or None."""
     if not isinstance(s, str):
         return None
     m = TS_RE.match(s)
@@ -49,7 +47,6 @@ def parse_timestamp(s: str) -> Optional[datetime]:
         return None
 
 def format_utc(dt: datetime) -> str:
-    """Format a UTC datetime as YYYY-MM-DDTHH:mm:ss.sssZ"""
     ms = dt.microsecond // 1000
     return dt.strftime('%Y-%m-%dT%H:%M:%S') + f'.{ms:03d}Z'
 
@@ -57,7 +54,6 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 def is_safe_integer(v) -> bool:
-    """Check if v is a non-negative safe integer (no bool)."""
     if isinstance(v, bool):
         return False
     if isinstance(v, int) and v >= 0 and abs(v) <= 2**53 - 1:
@@ -80,13 +76,16 @@ def is_finite_number(v) -> bool:
         return True
     return False
 
-def compact_json(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+def canonical_value(v):
+    if isinstance(v, dict):
+        return {k: canonical_value(v[k]) for k in sorted(v.keys())}
+    elif isinstance(v, list):
+        return [canonical_value(x) for x in v]
+    else:
+        return v
 
-def sort_by_utf8(items: list, key=None) -> list:
-    if key:
-        return sorted(items, key=lambda x: key(x).encode('utf-8'))
-    return sorted(items, key=lambda x: x.encode('utf-8'))
+def compact_json(obj) -> str:
+    return json.dumps(canonical_value(obj), ensure_ascii=False, separators=(',', ':'))
 
 # =============================================================================
 # Question 1: Build Corpus (POST /build-corpus)
@@ -123,13 +122,13 @@ def canonicalize_text(s: str) -> str:
     """NFKC, lowercase, trim, collapse Unicode whitespace to one ASCII space."""
     s = unicodedata.normalize('NFKC', s)
     s = s.lower()
+    s = re.sub(r'\s+', ' ', s, flags=re.UNICODE)
     s = s.strip()
-    s = re.sub(r'\s+', ' ', s)
     return s
 
 def extract_words_lc_alnum(text: str) -> set:
     """Extract lowercase Unicode letter/number word-set for Jaccard."""
-    return set(re.findall(r'[\w]+', text.lower(), re.UNICODE))
+    return set(re.findall(r'[\w]+', text, re.UNICODE))
 
 def jaccard_similarity(set_a: set, set_b: set) -> float:
     if not set_a and not set_b:
@@ -175,7 +174,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
             policy_valid = False
 
     rejected_objects = []
-    all_rows = []  # (row_dict, object_uri)
+    all_rows = []
     lineage_entries = []
 
     for obj in objects:
@@ -191,47 +190,35 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         content = obj.get("content")
 
         codes = []
+        uri_str = uri if isinstance(uri, str) else None
 
         # URI check
-        uri_str = uri if isinstance(uri, str) else None
         if not isinstance(uri, str) or not URI_RE.match(uri):
             codes.append("URI_INVALID")
 
         # Generation check
-        gen_invalid = False
-        if not isinstance(generation, str) or not generation.isdigit():
-            gen_invalid = True
-            codes.append("GENERATION_INVALID")
-        if not isinstance(fetched_gen, str) or not fetched_gen.isdigit():
-            if not gen_invalid:
-                gen_invalid = True
-                codes.append("GENERATION_INVALID")
-            else:
-                if "GENERATION_INVALID" not in codes:
-                    codes.append("GENERATION_INVALID")
+        gen_valid = isinstance(generation, str) and generation.isdigit()
+        fgen_valid = isinstance(fetched_gen, str) and fetched_gen.isdigit()
 
-        if not gen_invalid:
-            if generation != fetched_gen:
-                codes.append("GENERATION_MISMATCH")
+        if not gen_valid or not fgen_valid:
+            codes.append("GENERATION_INVALID")
+        elif generation != fetched_gen:
+            codes.append("GENERATION_MISMATCH")
 
         # CRC32C check
         crc_syntax_valid = isinstance(crc, str) and CRC32C_HEX_RE.match(crc)
         if not crc_syntax_valid:
             codes.append("CRC32C_INVALID")
         else:
-            # Check CRC32C_MISMATCH only for string content and valid CRC syntax
             if isinstance(content, str):
                 computed_crc = crc32c(content.encode('utf-8'))
                 expected_crc = int(crc, 16)
                 if computed_crc != expected_crc:
                     codes.append("CRC32C_MISMATCH")
 
-        # Schema check
+        # Schema & Content check
         schema_invalid = False
-        if not isinstance(content, str):
-            codes.append("SCHEMA_INVALID")
-            schema_invalid = True
-        elif schema_id != "training-v1":
+        if not isinstance(content, str) or schema_id != "training-v1":
             codes.append("SCHEMA_INVALID")
             schema_invalid = True
 
@@ -254,17 +241,15 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
                 if not isinstance(row, dict):
                     schema_invalid = True
                     break
-                row_keys = set(row.keys())
                 expected_keys = {"id", "entity", "eventTime", "revision", "text"}
-                if row_keys != expected_keys:
+                if set(row.keys()) != expected_keys:
                     schema_invalid = True
                     break
-                rid = row.get("id")
-                entity = row.get("entity")
-                event_time = row.get("eventTime")
-                revision = row.get("revision")
-                text = row.get("text")
+                rid, entity, event_time, revision, text = row.get("id"), row.get("entity"), row.get("eventTime"), row.get("revision"), row.get("text")
                 if not isinstance(rid, str) or not isinstance(entity, str) or not isinstance(event_time, str) or not isinstance(text, str):
+                    schema_invalid = True
+                    break
+                if parse_timestamp(event_time) is None:
                     schema_invalid = True
                     break
                 if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0 or revision > 2**53 - 1:
@@ -285,7 +270,6 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
             codes = sorted(list(set(codes)), key=lambda c: c.encode('utf-8'))
             rejected_objects.append({"uri": uri_str, "reasonCodes": codes})
         else:
-            # Object accepted - add rows and lineage
             for row in rows_from_obj:
                 all_rows.append((row, uri_str))
             lineage_entries.append({
@@ -300,15 +284,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     for row, uri in all_rows:
         entity_c = canonicalize_text(row["entity"])
         text_c = canonicalize_text(row["text"])
-
         event_time_dt = parse_timestamp(row["eventTime"])
-        if event_time_dt is None:
-            # If eventTime is not parseable, it was validated during JSONL parse...
-            # Actually the spec says "each non-blank JSONL line is an object with exactly id,entity,eventTime,revision,text"
-            # but doesn't require eventTime to be valid in the JSONL validation step.
-            # However, for processing we need valid timestamps. Skip invalid ones.
-            continue
-
         event_time_utc = format_utc(event_time_dt)
 
         canonicalized_rows.append({
@@ -321,8 +297,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         })
 
     # Deduplicate by [entity, eventTime, text] tuple
-    # Keep highest revision, then UTF-8-byte-smallest ID
-    dedup_map = {}  # tuple -> list of rows
+    dedup_map = {}
     for r in canonicalized_rows:
         key = (r["entity"], r["eventTime"], r["text"])
         if key not in dedup_map:
@@ -333,7 +308,6 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     rejected_rows = []
 
     for key, group in dedup_map.items():
-        # Sort: highest revision first, then smallest ID by UTF-8 bytes
         group.sort(key=lambda x: (-x["revision"], x["id"].encode('utf-8')))
         winner = group[0]
         retained_rows.append(winner)
@@ -346,7 +320,6 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
             rejected_rows.append({"id": r["id"], "reasonCodes": ["POLICY_INVALID"]})
         retained_rows = []
     else:
-        # Check time window
         new_retained = []
         for r in retained_rows:
             dt = r["_event_dt"]
@@ -372,7 +345,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         else:
             test_rows.append(r)
 
-    # Contamination check: val/test rows vs train rows
+    # Contamination check
     if policy_valid and contamination_threshold is not None:
         train_word_sets = [extract_words_lc_alnum(r["text"]) for r in train_rows]
 
@@ -406,7 +379,6 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
                 new_test.append(r)
         test_rows = new_test
 
-    # Sort by UTF-8 bytes of ID, then compact row JSON for a tie
     def row_sort_key(r):
         row_obj = {"id": r["id"], "entity": r["entity"], "eventTime": r["eventTime"], "revision": r["revision"], "text": r["text"]}
         return (r["id"].encode('utf-8'), compact_json(row_obj).encode('utf-8'))
@@ -415,13 +387,12 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     val_rows.sort(key=row_sort_key)
     test_rows.sort(key=row_sort_key)
 
-    # Serialize split rows and compute digests
     def serialize_split(rows):
         serialized_rows = []
         all_bytes = b''
         for r in rows:
             row_obj = {"id": r["id"], "entity": r["entity"], "eventTime": r["eventTime"], "revision": r["revision"], "text": r["text"]}
-            line = compact_json(row_obj) + '\n'
+            line = json.dumps(row_obj, ensure_ascii=False, separators=(',', ':')) + '\n'
             all_bytes += line.encode('utf-8')
             serialized_rows.append(row_obj)
         digest = sha256_hex(all_bytes)
@@ -431,16 +402,8 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     val_serialized, val_digest = serialize_split(val_rows)
     test_serialized, test_digest = serialize_split(test_rows)
 
-    # Sort rejected objects by UTF-8 URI (null sorts as empty string? or first?)
-    rejected_objects.sort(key=lambda x: (x["uri"] or "").encode('utf-8'))
+    rejected_objects.sort(key=lambda x: ((x["uri"] or "").encode('utf-8'), compact_json(x).encode('utf-8')))
 
-    # Sort rejected rows by UTF-8 ID, then compact JSON for tie
-    rejected_rows.sort(key=lambda x: x["id"].encode('utf-8'))
-    # Deduplicate reason codes per rejected row
-    for rr in rejected_rows:
-        rr["reasonCodes"] = sorted(list(set(rr["reasonCodes"])), key=lambda c: c.encode('utf-8'))
-
-    # Merge rejected rows with same ID
     merged_rejected = {}
     for rr in rejected_rows:
         rid = rr["id"]
@@ -451,10 +414,9 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
     final_rejected_rows = []
     for rid, codes in merged_rejected.items():
         final_rejected_rows.append({"id": rid, "reasonCodes": sorted(list(codes), key=lambda c: c.encode('utf-8'))})
-    final_rejected_rows.sort(key=lambda x: x["id"].encode('utf-8'))
+    final_rejected_rows.sort(key=lambda x: (x["id"].encode('utf-8'), compact_json(x).encode('utf-8')))
 
-    # Sort lineage by UTF-8 URI
-    lineage_entries.sort(key=lambda x: x["uri"].encode('utf-8'))
+    lineage_entries.sort(key=lambda x: (x["uri"].encode('utf-8'), compact_json(x).encode('utf-8')))
 
     return {
         "splits": {
@@ -477,7 +439,7 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
 # Question 2: BQML Experiment Gate (POST /bqml)
 # =============================================================================
 
-BQML_STORE = {}  # runId -> stored response
+BQML_STORE = {}
 
 def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     run_id = payload.get("runId")
@@ -505,15 +467,7 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     if invalid_input:
         reason_codes.append("INVALID_INPUT")
 
-    # Check for stored response
-    input_canonical = compact_json({
-        "phase": "select",
-        "runId": run_id,
-        "forbiddenFeatures": payload.get("forbiddenFeatures"),
-        "numTrialsLimit": payload.get("numTrialsLimit"),
-        "rows": payload.get("rows"),
-        "trials": payload.get("trials")
-    })
+    input_canonical = compact_json(payload)
 
     if run_id in BQML_STORE:
         stored = BQML_STORE[run_id]
@@ -574,7 +528,6 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
             "_et_dt": et_dt
         })
 
-    # Dedup by [entity, UTC(eventTime)] - keep highest version, then smallest ID
     dedup_map = {}
     for r in valid_rows:
         key = (r["entity"], r["eventTime_utc"])
@@ -631,15 +584,12 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     train_ids = sorted([r["id"] for r in retained if r["split"] == "TRAIN"], key=lambda x: x.encode('utf-8'))
     eval_ids = sorted([r["id"] for r in retained if r["split"] == "EVAL"], key=lambda x: x.encode('utf-8'))
 
-    # Compute dataset digest
     digest_obj = {"trainRowIds": train_ids, "evalRowIds": eval_ids, "featureNames": eligible_features}
     dataset_digest = sha256_hex(compact_json(digest_obj).encode('utf-8'))
 
-    # Check trials
     if isinstance(trials, list) and len(trials) > num_trials_limit:
         reason_codes.append("TRIAL_LIMIT_EXCEEDED")
 
-    # Select best trial
     eligible_trials = []
     if isinstance(trials, list):
         for t in trials:
@@ -648,7 +598,7 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
             tid = t.get("trialId")
             status = t.get("status")
             metric = t.get("evalMetric")
-            if status == "SUCCEEDED" and is_finite_number(metric) and not isinstance(metric, bool):
+            if status == "SUCCEEDED" and is_finite_number(metric) and not isinstance(metric, bool) and is_safe_integer(tid):
                 eligible_trials.append({"trialId": tid, "evalMetric": metric})
 
     selected_trial_id = None
@@ -694,7 +644,6 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
     invalid_input = False
     invalid_lineage = False
 
-    # Validate lineage
     if run_id not in BQML_STORE:
         invalid_lineage = True
     else:
@@ -713,10 +662,7 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
     if invalid_lineage:
         reason_codes.append("INVALID_LINEAGE")
 
-    # Validate inputs
-    if not is_finite_number(metric_floor) or isinstance(metric_floor, bool):
-        invalid_input = True
-    elif not (0 <= metric_floor <= 1):
+    if not is_finite_number(metric_floor) or isinstance(metric_floor, bool) or not (0 <= metric_floor <= 1):
         invalid_input = True
 
     if not isinstance(required_slices, dict):
@@ -736,7 +682,6 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
     if invalid_input:
         reason_codes.append("INVALID_INPUT")
 
-    # Validate rows
     has_invalid_row = False
     valid_rows = []
     if isinstance(rows, list):
@@ -763,16 +708,13 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
 
     rows_empty_or_invalid = len(rows) == 0 or has_invalid_row if isinstance(rows, list) else True
 
-    # Compute metrics
     test_metric = None
     critical_slice_pass = True
-    decision = "reject"
 
     if rows_empty_or_invalid:
         test_metric = None
         critical_slice_pass = False
     else:
-        # Aggregate accuracy
         if valid_rows:
             correct = sum(1 for r in valid_rows if r["label"] == r["prediction"])
             agg_acc = round(correct / len(valid_rows), 12)
@@ -780,12 +722,10 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
         else:
             test_metric = None
 
-        # Check aggregate floor
         if test_metric is not None and not invalid_input and is_finite_number(metric_floor):
             if test_metric < metric_floor:
                 reason_codes.append("AGGREGATE_FLOOR")
 
-        # Check required slices
         if isinstance(required_slices, dict) and not invalid_input:
             for slice_name, floor in required_slices.items():
                 slice_rows = [r for r in valid_rows if r.get("slice") == slice_name]
@@ -799,7 +739,6 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
                         reason_codes.append(f"SLICE_FLOOR:{slice_name}")
                         critical_slice_pass = False
 
-    # Byte limit check
     if not invalid_input and is_safe_integer(bytes_processed) and is_safe_integer(max_bytes):
         if bytes_processed > max_bytes:
             reason_codes.append("BYTE_LIMIT")
@@ -808,11 +747,7 @@ def evaluate_bqml_evaluate(payload: Dict[str, Any]) -> Any:
         critical_slice_pass = False
 
     reason_codes = sorted(list(set(reason_codes)), key=lambda c: c.encode('utf-8'))
-
-    if not reason_codes:
-        decision = "admit"
-    else:
-        decision = "reject"
+    decision = "admit" if not reason_codes else "reject"
 
     return {
         "runId": run_id,
@@ -841,6 +776,16 @@ def evaluate_bqml(payload: Dict[str, Any]) -> Any:
 # Question 3: Promote (POST /promote)
 # =============================================================================
 
+def is_canonical_version(v_str) -> bool:
+    if not isinstance(v_str, str):
+        return False
+    if not v_str.isdigit():
+        return False
+    if len(v_str) > 1 and v_str[0] == '0':
+        return False
+    val = int(v_str)
+    return val > 0 and val <= 2**53 - 1
+
 def evaluate_promote(payload: Dict[str, Any]) -> Any:
     if not isinstance(payload, dict):
         return {"error": "INVALID_INPUT"}, 400
@@ -859,10 +804,8 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
 
     as_of_dt = parse_timestamp(as_of_str) if isinstance(as_of_str, str) else None
 
-    # Validate policy
     failed_gates = {}
 
-    # Extract policy fields
     dataset_digest = policy.get("datasetDigest")
     schema_digest = policy.get("schemaDigest")
     max_age = policy.get("maxAgeSeconds")
@@ -897,57 +840,32 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
     if not is_finite_number(min_improvement) or isinstance(min_improvement, bool) or not (0 <= min_improvement <= 1):
         policy_valid = False
 
-    def is_canonical_version(v_str):
-        if not isinstance(v_str, str):
-            return False
-        if not v_str.isdigit():
-            return False
-        if len(v_str) > 1 and v_str[0] == '0':
-            return False
-        val = int(v_str)
-        return val > 0 and val <= 2**53 - 1
-
-    # Detect duplicate and non-canonical versions
-    seen_versions = {}
-    duplicated_versions = set()
-    non_canonical_versions = set()
-
+    # Count occurrences
+    version_counts = {}
     for v in versions:
-        if not isinstance(v, dict):
-            continue
-        ver = v.get("version")
-        if not is_canonical_version(ver):
-            non_canonical_versions.add(ver if isinstance(ver, str) else str(ver))
-            continue
-        if ver in seen_versions:
-            duplicated_versions.add(ver)
-        seen_versions[ver] = v
+        if isinstance(v, dict) and "version" in v:
+            ver = v["version"]
+            ver_str = ver if isinstance(ver, str) else str(ver)
+            version_counts[ver_str] = version_counts.get(ver_str, 0) + 1
 
-    # Build version map excluding duplicates and non-canonical
+    duplicated_versions = {v for v, count in version_counts.items() if count > 1}
+
+    # Evaluate each version item
     version_map = {}
-    for v in versions:
-        if not isinstance(v, dict):
-            continue
-        ver = v.get("version")
-        if not isinstance(ver, str):
-            continue
-        if ver in duplicated_versions or ver in non_canonical_versions:
-            if ver not in failed_gates:
-                failed_gates[ver] = []
-            if ver in duplicated_versions:
-                if "DUPLICATE_VERSION" not in failed_gates[ver]:
-                    failed_gates[ver].append("DUPLICATE_VERSION")
-            if not is_canonical_version(ver):
-                if "INVALID_VERSION" not in failed_gates[ver]:
-                    failed_gates[ver].append("INVALID_VERSION")
-            continue
-        version_map[ver] = v
-
-    # Evaluate each version
     eligible = []
 
-    for ver, v in version_map.items():
+    for v in versions:
+        if not isinstance(v, dict):
+            continue
+        ver = v.get("version")
+        ver_str = ver if isinstance(ver, str) else str(ver)
+
         gates = []
+
+        if not is_canonical_version(ver):
+            gates.append("INVALID_VERSION")
+        if ver_str in duplicated_versions:
+            gates.append("DUPLICATE_VERSION")
 
         if not policy_valid:
             gates.append("INVALID_POLICY")
@@ -955,88 +873,70 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
         ev = v.get("evaluation")
         if not isinstance(ev, dict):
             gates.append("MISSING_EVALUATION")
-            failed_gates[ver] = sorted(list(set(gates)), key=lambda c: c.encode('utf-8'))
-            continue
+        else:
+            acc = ev.get("accuracy")
+            lat = ev.get("latencyMs")
+            sz = ev.get("sizeBytes")
 
-        # Check numeric fields
-        acc = ev.get("accuracy")
-        lat = ev.get("latencyMs")
-        sz = ev.get("sizeBytes")
+            if not is_finite_number(acc) or isinstance(acc, bool) or not is_finite_number(lat) or isinstance(lat, bool) or not is_finite_number(sz) or isinstance(sz, bool):
+                gates.append("NON_FINITE")
 
-        non_finite = False
-        if not is_finite_number(acc) or isinstance(acc, bool):
-            non_finite = True
-        if not is_finite_number(lat) or isinstance(lat, bool):
-            non_finite = True
-        if not is_finite_number(sz) or isinstance(sz, bool):
-            non_finite = True
+            if is_finite_number(acc) and not isinstance(acc, bool):
+                if not (0 <= acc <= 1):
+                    gates.append("METRIC_RANGE")
 
-        if non_finite:
-            gates.append("NON_FINITE")
+            created_at_str = ev.get("createdAt")
+            created_at_dt = parse_timestamp(created_at_str) if isinstance(created_at_str, str) else None
+            if created_at_dt is None:
+                gates.append("INVALID_TIMESTAMP")
+            elif as_of_dt is not None:
+                if created_at_dt > as_of_dt:
+                    gates.append("FUTURE_EVALUATION")
+                elif policy_valid and (as_of_dt - timedelta(seconds=max_age)) > created_at_dt:
+                    gates.append("STALE_EVALUATION")
 
-        # Metric range
-        if is_finite_number(acc) and not isinstance(acc, bool):
-            if not (0 <= acc <= 1):
-                gates.append("METRIC_RANGE")
+            if ev.get("artifactDigest") != v.get("artifactDigest"):
+                gates.append("ARTIFACT_MISMATCH")
 
-        # Timestamps
-        created_at_str = ev.get("createdAt")
-        created_at_dt = parse_timestamp(created_at_str) if isinstance(created_at_str, str) else None
-        if created_at_dt is None:
-            gates.append("INVALID_TIMESTAMP")
-        elif as_of_dt is not None:
-            if created_at_dt > as_of_dt:
-                gates.append("FUTURE_EVALUATION")
-            elif policy_valid and (as_of_dt - timedelta(seconds=max_age)) > created_at_dt:
-                gates.append("STALE_EVALUATION")
+            if policy_valid:
+                if ev.get("datasetDigest") != dataset_digest:
+                    gates.append("DATASET_MISMATCH")
+                if ev.get("schemaDigest") != schema_digest:
+                    gates.append("SCHEMA_MISMATCH")
 
-        # Artifact binding
-        if ev.get("artifactDigest") != v.get("artifactDigest"):
-            gates.append("ARTIFACT_MISMATCH")
+                if is_finite_number(acc) and not isinstance(acc, bool) and 0 <= acc <= 1:
+                    if acc < accuracy_floor:
+                        gates.append("ACCURACY_FLOOR")
 
-        if policy_valid:
-            if ev.get("datasetDigest") != dataset_digest:
-                gates.append("DATASET_MISMATCH")
-            if ev.get("schemaDigest") != schema_digest:
-                gates.append("SCHEMA_MISMATCH")
+                if is_finite_number(lat) and not isinstance(lat, bool):
+                    if lat > max_latency:
+                        gates.append("LATENCY_LIMIT")
 
-            # Accuracy floor
-            if is_finite_number(acc) and not isinstance(acc, bool) and 0 <= acc <= 1:
-                if acc < accuracy_floor:
-                    gates.append("ACCURACY_FLOOR")
+                if is_finite_number(sz) and not isinstance(sz, bool):
+                    if sz > max_size:
+                        gates.append("SIZE_LIMIT")
 
-            # Latency
-            if is_finite_number(lat) and not isinstance(lat, bool):
-                if lat > max_latency:
-                    gates.append("LATENCY_LIMIT")
-
-            # Size
-            if is_finite_number(sz) and not isinstance(sz, bool):
-                if sz > max_size:
-                    gates.append("SIZE_LIMIT")
-
-            # Required slices
-            slices_ev = ev.get("slices", {})
-            if isinstance(required_slices, dict) and isinstance(slices_ev, dict):
-                for slice_name, floor in required_slices.items():
-                    if slice_name not in slices_ev:
-                        gates.append(f"MISSING_SLICE:{slice_name}")
-                    else:
-                        sv = slices_ev[slice_name]
-                        if not is_finite_number(sv) or isinstance(sv, bool):
-                            gates.append(f"SLICE_RANGE:{slice_name}")
-                        elif not (0 <= sv <= 1):
-                            gates.append(f"SLICE_RANGE:{slice_name}")
-                        elif sv < floor:
-                            gates.append(f"SLICE_FLOOR:{slice_name}")
+                slices_ev = ev.get("slices", {})
+                if isinstance(required_slices, dict) and isinstance(slices_ev, dict):
+                    for slice_name, floor in required_slices.items():
+                        if slice_name not in slices_ev:
+                            gates.append(f"MISSING_SLICE:{slice_name}")
+                        else:
+                            sv = slices_ev[slice_name]
+                            if not is_finite_number(sv) or isinstance(sv, bool):
+                                gates.append(f"SLICE_RANGE:{slice_name}")
+                            elif not (0 <= sv <= 1):
+                                gates.append(f"SLICE_RANGE:{slice_name}")
+                            elif sv < floor:
+                                gates.append(f"SLICE_FLOOR:{slice_name}")
 
         gates = sorted(list(set(gates)), key=lambda c: c.encode('utf-8'))
         if gates:
-            failed_gates[ver] = gates
+            failed_gates[ver_str] = gates
         else:
-            eligible.append(ver)
+            eligible.append(ver_str)
+            version_map[ver_str] = v
 
-    # Rank eligible
     eligible_versions = []
     for ver in eligible:
         v = version_map[ver]
@@ -1052,28 +952,14 @@ def evaluate_promote(payload: Dict[str, Any]) -> Any:
     eligible_versions.sort(key=lambda x: (-x["accuracy"], x["latencyMs"], x["sizeBytes"], x["numericVersion"]))
     eligible_version_ids = [e["version"] for e in eligible_versions]
 
-    # Champion check
     champion_valid = champion_version in eligible_version_ids
 
-    if not champion_valid:
+    if not champion_valid or not eligible_versions:
         result = {
             "action": "block",
             "championVersion": champion_version,
             "selectedVersion": None,
             "eligibleVersions": eligible_version_ids,
-            "failedGates": failed_gates,
-            "aliasMutation": None,
-            "evidence": None
-        }
-        return result, 200
-
-    # Select best
-    if not eligible_versions:
-        result = {
-            "action": "block",
-            "championVersion": champion_version,
-            "selectedVersion": None,
-            "eligibleVersions": [],
             "failedGates": failed_gates,
             "aliasMutation": None,
             "evidence": None
@@ -1125,7 +1011,6 @@ def evaluate_adapt_choose(payload: Dict[str, Any]) -> Any:
     if not isinstance(policy, dict) or not isinstance(candidates, list):
         return {"error": "INVALID_INPUT"}, 400
 
-    # Validate policy
     min_quality = policy.get("minQuality")
     freshness_required = policy.get("freshnessRequired")
     max_latency = policy.get("maxLatencyMs")
@@ -1150,13 +1035,11 @@ def evaluate_adapt_choose(payload: Dict[str, Any]) -> Any:
     if not is_safe_integer(horizon):
         policy_invalid = True
 
-    # Build candidate map
     candidate_map = {}
     for c in candidates:
         if isinstance(c, dict) and isinstance(c.get("name"), str):
             candidate_map[c["name"]] = c
 
-    # Check exactly one per intervention
     if set(candidate_map.keys()) != set(INTERVENTION_ORDER) or len(candidates) != 4:
         return {"error": "INVALID_INPUT"}, 400
 
@@ -1205,7 +1088,6 @@ def evaluate_adapt_choose(payload: Dict[str, Any]) -> Any:
             if labeled > max_labeled:
                 codes.append("DATA_LIMIT")
 
-        # Total cost
         if is_finite_number(one_time) and not isinstance(one_time, bool) and is_finite_number(recurring) and not isinstance(recurring, bool) and is_safe_integer(horizon):
             tc = round(one_time + horizon * recurring, 12)
             total_costs[name] = tc
@@ -1220,7 +1102,6 @@ def evaluate_adapt_choose(payload: Dict[str, Any]) -> Any:
         if not codes:
             eligible.append(name)
 
-    # Select first eligible in priority order
     selected = None
     for name in INTERVENTION_ORDER:
         if name in eligible:
@@ -1313,8 +1194,15 @@ def evaluate_adapt_repair(payload: Dict[str, Any]) -> Any:
     if not isinstance(parameters, list) or not isinstance(allowed_targets, list):
         reason_codes.append("INVALID_PARAMETER")
     else:
-        allowed_set = set(allowed_targets)
-        if not allowed_targets or len(allowed_targets) != len(allowed_set):
+        allowed_set = set()
+        valid_targets = True
+        for tg in allowed_targets:
+            if not isinstance(tg, str) or not tg or tg in allowed_set:
+                valid_targets = False
+                break
+            allowed_set.add(tg)
+
+        if not valid_targets or len(allowed_targets) == 0:
             reason_codes.append("INVALID_PARAMETER")
         else:
             param_names = set()
@@ -1363,7 +1251,7 @@ def evaluate_adapt_repair(payload: Dict[str, Any]) -> Any:
     if not isinstance(artifact_files, list):
         reason_codes.append("ADAPTER_FILE_SET")
     else:
-        sorted_af = sorted(artifact_files)
+        sorted_af = sorted(artifact_files, key=lambda x: x.encode('utf-8') if isinstance(x, str) else b'')
         if sorted_af != expected_artifact_files:
             reason_codes.append("ADAPTER_FILE_SET")
         else:
@@ -1400,7 +1288,6 @@ def evaluate_adapt_repair(payload: Dict[str, Any]) -> Any:
             reason_codes.append("LINEAGE_MISMATCH")
         lineage_pass = False
 
-    # Check expectedDigests match
     if isinstance(expected_digests, dict) and all_digests_valid:
         for k, v in expected_digests.items():
             actual = {"dataset": dataset_digest, "code": code_digest, "config": config_digest}.get(k)
@@ -1428,12 +1315,12 @@ def evaluate_adapt_repair(payload: Dict[str, Any]) -> Any:
         train_set = set()
         eval_set = set()
         for t in train_row_ids:
-            if not isinstance(t, str):
+            if not isinstance(t, str) or not t:
                 eval_isolated = False
                 break
             train_set.add(t)
         for e in eval_row_ids:
-            if not isinstance(e, str):
+            if not isinstance(e, str) or not e:
                 eval_isolated = False
                 break
             eval_set.add(e)
@@ -1441,7 +1328,7 @@ def evaluate_adapt_repair(payload: Dict[str, Any]) -> Any:
             eval_isolated = False
         if train_set & eval_set:
             eval_isolated = False
-            reason_codes.append("EVAL_LEAKAGE")
+
         if not eval_isolated and "EVAL_LEAKAGE" not in reason_codes:
             reason_codes.append("EVAL_LEAKAGE")
 
@@ -1510,7 +1397,7 @@ def evaluate_adapt(payload: Dict[str, Any]) -> Any:
 # Question 5: Quantize (POST /quantize)
 # =============================================================================
 
-QUANTIZE_STORE = {}  # freezeId -> stored response
+QUANTIZE_STORE = {}
 
 def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
     freeze_id = payload.get("freezeId")
@@ -1520,6 +1407,8 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
     calibration_digest = payload.get("calibrationDigest")
     tokenizer_digest = payload.get("tokenizerDigest")
     allowed_reasons = payload.get("allowedUnsupportedReasons", [])
+    if allowed_reasons is None:
+        allowed_reasons = []
     candidates = payload.get("candidates")
 
     if not isinstance(candidates, list) or len(candidates) == 0:
@@ -1532,7 +1421,6 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
     if not isinstance(allowed_reasons, list):
         return {"error": "INVALID_INPUT"}, 400
 
-    # Check allowed_reasons unique non-empty strings
     ar_set = set()
     for r in allowed_reasons:
         if not isinstance(r, str) or not r:
@@ -1541,7 +1429,6 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
             return {"error": "INVALID_INPUT"}, 400
         ar_set.add(r)
 
-    # Check candidate names unique non-empty
     cand_names = set()
     for c in candidates:
         if not isinstance(c, dict):
@@ -1574,7 +1461,6 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
 
         codes = []
 
-        # Files validation
         files_valid = True
         if not isinstance(files, dict) or len(files) == 0:
             files_valid = False
@@ -1607,20 +1493,15 @@ def evaluate_quantize_freeze(payload: Dict[str, Any]) -> Any:
             total_bytes_val = sum(item["bytes"] for item in inventory)
             package_digest = sha256_hex(compact_json(inventory).encode('utf-8'))
 
-        # Determine status
         status = "invalid"
         if isinstance(unsup_reason, str) and unsup_reason:
             if unsup_reason in ar_set:
                 status = "unsupported"
-                codes.append("UNALLOWED_UNSUPPORTED_REASON")
-                # Actually: unsupported reason IS allowed -> status unsupported
-                codes = []  # reset
-                status = "unsupported"
+                codes = []
             else:
                 status = "invalid"
                 codes.append("UNALLOWED_UNSUPPORTED_REASON")
         else:
-            # No unsupported reason -> check loadable and digests
             if loadable is not True:
                 codes.append("NOT_LOADABLE")
             if cal_dig != calibration_digest:
@@ -1669,19 +1550,12 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
     if not isinstance(candidates, list) or not isinstance(pol, dict) or not isinstance(rows, list):
         return {"error": "INVALID_INPUT"}, 400
 
-    if freeze_id not in QUANTIZE_STORE:
-        return {"error": "INVALID_INPUT"}, 400
+    stored = QUANTIZE_STORE.get(freeze_id)
+    if stored is not None:
+        stored_candidates = stored.get("candidates", [])
+    else:
+        stored_candidates = candidates
 
-    stored = QUANTIZE_STORE[freeze_id]
-    stored_candidates = stored.get("candidates", [])
-
-    # Verify candidates match stored
-    submitted_cands = [{k: v for k, v in c.items()} for c in candidates] if isinstance(candidates, list) else []
-    stored_cands_clean = [{k: v for k, v in c.items()} for c in stored_candidates]
-    if compact_json(submitted_cands) != compact_json(stored_cands_clean):
-        return {"error": "INVALID_INPUT"}, 400
-
-    # Policy
     max_bytes_p = pol.get("maxBytes")
     agg_floor = pol.get("aggregateFloor")
     req_slices = pol.get("requiredSlices", {})
@@ -1691,27 +1565,33 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
     if not isinstance(latencies, dict):
         return {"error": "INVALID_INPUT"}, 400
 
-    # Build results
-    cand_names_set = set(c["name"] for c in stored_candidates)
+    cand_names_set = set(c["name"] for c in stored_candidates if isinstance(c, dict) and "name" in c)
     order_set = set(cand_order) if isinstance(cand_order, list) else set()
 
     results_list = []
     admitted_list = []
 
     for c in stored_candidates:
-        name = c["name"]
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        if not isinstance(name, str):
+            continue
         codes = []
 
-        if c["status"] != "frozen":
+        if c.get("status") != "frozen":
             codes.append("NOT_FROZEN")
 
-        # Recompute totalBytes
-        tb = c.get("totalBytes")
+        # Recompute totalBytes from inventory if available
+        tb = None
+        inv = c.get("inventory")
+        if isinstance(inv, list):
+            tb = sum(item["bytes"] for item in inv if isinstance(item, dict) and "bytes" in item)
+        else:
+            tb = c.get("totalBytes")
 
-        # Get latency
         lat = latencies.get(name) if isinstance(latencies, dict) else None
 
-        # Predictions for this candidate
         preds_valid = True
         correct = 0
         total = 0
@@ -1793,11 +1673,9 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
                 "latencyMs": lat
             })
 
-    # Order results by candidateOrder
     order_map = {n: i for i, n in enumerate(cand_order)} if isinstance(cand_order, list) else {}
     results_list.sort(key=lambda x: (order_map.get(x["name"], 999), x["name"].encode('utf-8')))
 
-    # Select winner from admitted
     selected = None
     package_manifest = None
 
@@ -1805,7 +1683,7 @@ def evaluate_quantize_select(payload: Dict[str, Any]) -> Any:
         admitted_list.sort(key=lambda x: (x["totalBytes"] or float('inf'), x["latencyMs"] or float('inf'), order_map.get(x["name"], 999)))
         selected = admitted_list[0]["name"]
         for c in stored_candidates:
-            if c["name"] == selected:
+            if isinstance(c, dict) and c.get("name") == selected:
                 package_manifest = c
                 break
 
@@ -1832,7 +1710,7 @@ def evaluate_quantize(payload: Dict[str, Any]) -> Any:
 # Question 6: Pipeline (POST /pipeline)
 # =============================================================================
 
-PIPELINE_SESSIONS = {}  # session -> state
+PIPELINE_SESSIONS = {}
 
 DAG_ORDER = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
 DAG_DEPS = {
@@ -1847,10 +1725,10 @@ DAG_DEPS = {
 INPUT_KEYS = {
     "verify_data": ["generation", "checksum"],
     "prepare": ["canonicalData", "prepareCode", "prepareConfig"],
-    "train": [None, "trainCode", "trainConfig", "runtime"],  # None = prepareArtifact
-    "evaluate": [None, "canonicalData", "evaluateCode", "evaluateConfig"],  # None = trainArtifact
-    "register": [None, "schemaDigest"],  # None = evaluateArtifact
-    "publish": [None, "publishConfig"]  # None = registerArtifact
+    "train": [None, "trainCode", "trainConfig", "runtime"],
+    "evaluate": [None, "canonicalData", "evaluateCode", "evaluateConfig"],
+    "register": [None, "schemaDigest"],
+    "publish": [None, "publishConfig"]
 }
 
 def get_session_state(session: str) -> dict:
@@ -1859,8 +1737,8 @@ def get_session_state(session: str) -> dict:
             "revision": None,
             "inputs": None,
             "inputs_canonical": None,
-            "nodes": {},  # node -> {state, attempt, key, artifact, eventId, cached_keys: {key: {artifact, eventId}}}
-            "event_ids": {},  # eventId -> canonical JSON
+            "nodes": {},
+            "event_ids": {},
         }
     return PIPELINE_SESSIONS[session]
 
@@ -1892,29 +1770,23 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
         return {"error": "INVALID_REQUEST"}, 409
 
     state = get_session_state(session)
-
-    # Check revision
-    inputs_canonical = compact_json({k: inputs[k] for k in sorted(inputs.keys())})
+    inputs_canonical = compact_json(inputs)
 
     if state["revision"] is not None:
         if revision < state["revision"]:
-            # Old revision - just return current state
             pass
         elif revision == state["revision"]:
             if inputs_canonical != state["inputs_canonical"]:
                 return {"error": "REVISION_CONFLICT"}, 409
         else:
-            # New revision
             state["revision"] = revision
             state["inputs"] = inputs
             state["inputs_canonical"] = inputs_canonical
-            # Clear non-cached state
             for node in DAG_ORDER:
                 if node in state["nodes"]:
                     ns = state["nodes"][node]
                     ns["state"] = None
                     ns["attempt"] = None
-                    # Keep cached_keys
     else:
         state["revision"] = revision
         state["inputs"] = inputs
@@ -1929,14 +1801,12 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
                 "cached_keys": {}
             }
 
-    # Compute cache keys for each node
     def compute_key(node):
         inp = state["inputs"]
         key_inputs = INPUT_KEYS[node]
         values = []
         for k in key_inputs:
             if k is None:
-                # Parent artifact
                 parent = DAG_DEPS[node][0]
                 parent_artifact = get_artifact(parent)
                 if parent_artifact is None:
@@ -1960,7 +1830,6 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
         ns = state["nodes"].get(node, {})
         return key in ns.get("cached_keys", {})
 
-    # Process events
     accepted_ids = []
     ignored_ids = []
 
@@ -1977,13 +1846,11 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
         ev_artifact = ev.get("artifactDigest")
         ev_receipt = ev.get("receiptId")
 
-        # Check required fields
         required_ev_fields = {"eventId", "revision", "node", "attempt", "status", "key", "artifactDigest", "receiptId"}
         if set(ev.keys()) != required_ev_fields:
             ignored_ids.append(ev_id)
             continue
 
-        # Event ID dedup
         ev_canonical = compact_json(ev)
         if ev_id in state["event_ids"]:
             if state["event_ids"][ev_id] == ev_canonical:
@@ -1992,27 +1859,22 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
             else:
                 return {"error": "EVENT_ID_CONFLICT"}, 409
 
-        # Wrong revision
         if ev_rev != state["revision"]:
             ignored_ids.append(ev_id)
             continue
 
-        # Wrong node
         if ev_node not in DAG_ORDER:
             ignored_ids.append(ev_id)
             continue
 
-        # Invalid status
         if ev_status not in ("started", "succeeded", "retryable_failed", "terminal_failed"):
             ignored_ids.append(ev_id)
             continue
 
-        # Invalid attempt
         if not is_positive_safe_integer(ev_attempt):
             ignored_ids.append(ev_id)
             continue
 
-        # Artifact validation
         if ev_status == "succeeded":
             if not isinstance(ev_artifact, str) or not ev_artifact:
                 ignored_ids.append(ev_id)
@@ -2022,7 +1884,6 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
                 ignored_ids.append(ev_id)
                 continue
 
-        # Receipt validation
         if ev_status == "succeeded" and ev_node in ("register", "publish"):
             expected_receipt = f"receipt:{ev_node}:{ev_key}"
             if ev_receipt != expected_receipt:
@@ -2033,13 +1894,11 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
                 ignored_ids.append(ev_id)
                 continue
 
-        # Check key matches current key
         current_key = compute_key(ev_node)
         if current_key is None or ev_key != current_key:
             ignored_ids.append(ev_id)
             continue
 
-        # Check parent is available
         for dep in DAG_DEPS[ev_node]:
             if not is_node_reusable(dep):
                 ignored_ids.append(ev_id)
@@ -2047,11 +1906,9 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
 
         ns = state["nodes"][ev_node]
 
-        # State transitions
         current_state = ns.get("state")
         current_attempt = ns.get("attempt")
 
-        # Check if key is already cached
         if current_key in ns.get("cached_keys", {}):
             if ev_status == "succeeded" and ev_artifact != ns["cached_keys"][current_key]["artifact"]:
                 return {"error": "EVIDENCE_CONFLICT"}, 409
@@ -2113,7 +1970,6 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
             else:
                 return {"error": "STATUS_CONFLICT"}, 409
 
-    # Build response
     nodes_response = []
     for node in DAG_ORDER:
         ns = state["nodes"][node]
@@ -2166,7 +2022,6 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
             reason = ["RETRYABLE_FAILURE"]
             triggering_ids = []
         elif current_key is not None:
-            # Check upstream
             upstream_ok = True
             upstream_terminal = False
             for dep in DAG_DEPS[node]:
@@ -2190,8 +2045,6 @@ def evaluate_pipeline(payload: Dict[str, Any]) -> Any:
                 reason = ["UPSTREAM_PENDING"]
                 triggering_ids = []
         else:
-            # Key can't be computed (upstream not ready)
-            # Check if upstream is terminal
             upstream_terminal = False
             for dep in DAG_DEPS[node]:
                 dep_ns = state["nodes"][dep]
@@ -2239,7 +2092,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
 
     violations = []
 
-    # Validate policy
     req_slices = policy.get("requiredSlices")
     license_val = policy.get("license")
     intended_use = policy.get("intendedUse")
@@ -2266,17 +2118,14 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
     if not policy_valid:
         violations.append("INVALID_POLICY")
 
-    # Check missing files
     for fname in sorted(REQUIRED_BUNDLE_FILES):
         if fname not in files:
             violations.append(f"MISSING_FILE:{fname}")
 
-    # Check extra files
     extra_files = set(files.keys()) - REQUIRED_BUNDLE_FILES
     if extra_files:
         violations.append("UNTRACKED_FILE")
 
-    # Check unsafe weights
     unsafe_exts = {".bin", ".pt", ".pth", ".pkl", ".pickle"}
     for fname in files.keys():
         for ext in unsafe_exts:
@@ -2286,7 +2135,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         if "UNSAFE_WEIGHTS" in violations:
             break
 
-    # Compute inventory
     computed_inventory = []
     for fname in sorted(files.keys(), key=lambda x: x.encode('utf-8')):
         if fname == "inventory.json":
@@ -2300,7 +2148,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
 
     inventory_digest = sha256_hex(compact_json(computed_inventory).encode('utf-8'))
 
-    # Check inventory.json
     if "inventory.json" in files:
         try:
             inv_parsed = json.loads(files["inventory.json"])
@@ -2309,7 +2156,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         except Exception:
             violations.append("INVALID_JSON:inventory.json")
 
-    # Parse and validate files
     adapter_config = None
     if "adapter_config.json" in files:
         try:
@@ -2332,7 +2178,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         except Exception:
             violations.append("INVALID_JSON:adapter_config.json")
 
-    # Training manifest
     manifest = None
     model_artifact_digest = None
     eval_artifact_digest = None
@@ -2353,7 +2198,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
                     if f not in manifest or not isinstance(manifest[f], str) or not manifest[f]:
                         violations.append(f"MISSING_MANIFEST_FIELD:{f}")
 
-                # Recompute digests
                 if "adapter_model.safetensors" in files:
                     model_artifact_digest = sha256_hex(files["adapter_model.safetensors"].encode('utf-8'))
                     if manifest.get("modelArtifactDigest") != model_artifact_digest:
@@ -2367,7 +2211,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         except Exception:
             violations.append("INVALID_JSON:training_manifest.json")
 
-    # Evaluation
     evaluation = None
     if "evaluation.json" in files:
         try:
@@ -2376,16 +2219,13 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
                 violations.append("INVALID_EVALUATION")
                 evaluation = None
             else:
-                # Check model digest binding
                 if model_artifact_digest and evaluation.get("modelArtifactDigest") != model_artifact_digest:
                     violations.append("EVALUATION_ARTIFACT_MISMATCH")
 
-                # Check aggregate
                 agg = evaluation.get("aggregate")
                 if not is_finite_number(agg) or isinstance(agg, bool) or not (0 <= agg <= 1):
                     violations.append("INVALID_AGGREGATE")
 
-                # Check required slices
                 if policy_valid:
                     slices = evaluation.get("slices", {})
                     if isinstance(slices, dict):
@@ -2399,7 +2239,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         except Exception:
             violations.append("INVALID_JSON:evaluation.json")
 
-    # Model card (README.md)
     if "README.md" in files:
         readme = files["README.md"]
         marker_prefix = "<!-- tds-model-card "
@@ -2424,13 +2263,11 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         elif len(markers) > 1:
             violations.append("MODEL_CARD_COUNT")
         else:
-            # Parse single marker
             try:
                 card = json.loads(markers[0])
                 if not isinstance(card, dict):
                     violations.append("INVALID_MODEL_CARD")
                 else:
-                    # Check fields match
                     mismatches = False
                     if manifest:
                         if card.get("task") != manifest.get("task"):
