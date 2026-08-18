@@ -113,8 +113,10 @@ def evaluate_release_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         "violations": violations
     }
 
+@app.post("/")
 @app.post("/release-gate")
 @app.post("/release-gate/")
+@app.post("/release-gate/release-gate")
 async def release_gate_endpoint(request: Request):
     try:
         payload = await request.json()
