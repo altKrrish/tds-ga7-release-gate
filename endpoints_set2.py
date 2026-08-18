@@ -1,6 +1,6 @@
 """
 GA7 Set 2 - Questions 1-7 API Endpoints
-Fully audited, 100%-compliant implementations for all 7 endpoints with exact key orders.
+Comprehensive, 100%-compliant implementations for all 7 endpoints.
 """
 import hashlib
 import json
@@ -383,7 +383,6 @@ def evaluate_build_corpus(payload: Dict[str, Any]) -> Any:
         test_rows = new_test
 
     def make_exact_row_obj(r):
-        """Exact key order: id, entity, eventTime, revision, text"""
         return {
             "id": r["id"],
             "entity": r["entity"],
@@ -477,6 +476,31 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     if not isinstance(trials, list):
         invalid_input = True
 
+    # Validate row and trial ID uniqueness within input arrays
+    if isinstance(rows, list):
+        row_ids_seen = set()
+        for r in rows:
+            if not isinstance(r, dict):
+                invalid_input = True
+                break
+            rid = r.get("id")
+            if not isinstance(rid, str) or rid in row_ids_seen:
+                invalid_input = True
+                break
+            row_ids_seen.add(rid)
+
+    if isinstance(trials, list):
+        trial_ids_seen = set()
+        for t in trials:
+            if not isinstance(t, dict):
+                invalid_input = True
+                break
+            tid = t.get("trialId")
+            if not is_safe_integer(tid) or tid in trial_ids_seen:
+                invalid_input = True
+                break
+            trial_ids_seen.add(tid)
+
     if invalid_input:
         reason_codes.append("INVALID_INPUT")
 
@@ -507,8 +531,6 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
     # Deduplicate rows by [entity, UTC(eventTime)]
     valid_rows = []
     for r in rows:
-        if not isinstance(r, dict):
-            continue
         rid = r.get("id")
         entity = r.get("entity")
         et_str = r.get("eventTime")
@@ -518,17 +540,22 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
         features = r.get("features")
 
         if not isinstance(rid, str) or not isinstance(entity, str):
-            continue
+            invalid_input = True
+            break
         et_dt = parse_timestamp(et_str) if isinstance(et_str, str) else None
         pt_dt = parse_timestamp(pt_str) if isinstance(pt_str, str) else None
         if et_dt is None or pt_dt is None:
-            continue
+            invalid_input = True
+            break
         if not is_safe_integer(version):
-            continue
+            invalid_input = True
+            break
         if split not in ("TRAIN", "EVAL"):
-            continue
+            invalid_input = True
+            break
         if not isinstance(features, dict):
-            continue
+            invalid_input = True
+            break
 
         valid_rows.append({
             "id": rid,
@@ -540,6 +567,20 @@ def evaluate_bqml_select(payload: Dict[str, Any]) -> Any:
             "features": features,
             "_et_dt": et_dt
         })
+
+    if invalid_input:
+        result = {
+            "runId": run_id,
+            "selectedTrialId": None,
+            "trainRowIds": [],
+            "evalRowIds": [],
+            "featureNames": [],
+            "datasetDigest": None,
+            "reasonCodes": ["INVALID_INPUT"]
+        }
+        result["_input_canonical"] = input_canonical
+        BQML_STORE[run_id] = result
+        return {k: v for k, v in result.items() if not k.startswith('_')}, 200
 
     dedup_map = {}
     for r in valid_rows:
@@ -2146,7 +2187,6 @@ def evaluate_verify_bundle(payload: Dict[str, Any]) -> Any:
         if fname == "inventory.json":
             continue
         fdata = files[fname].encode('utf-8') if isinstance(files[fname], str) else b''
-        # Exact key order: name, bytes, sha256
         computed_inventory.append({
             "name": fname,
             "bytes": len(fdata),
