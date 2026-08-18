@@ -1,5 +1,5 @@
 import unittest
-from main import evaluate_release_gate, evaluate_action_firewall
+from main import evaluate_release_gate, evaluate_action_firewall, evaluate_terraform_plan
 
 def get_base_preview_payload():
     return {
@@ -304,6 +304,115 @@ class TestActionFirewall(unittest.TestCase):
         p = self.get_valid_payload("render_html", args={"html": "<a href='javascript:alert(1)'>click</a>"})
         res = evaluate_action_firewall(p)
         self.assertEqual(res, {"decision": "block", "reason": "UNSAFE_OUTPUT"})
+
+
+class TestTerraformPlanPolicy(unittest.TestCase):
+    def get_valid_tf_payload(self):
+        return {
+            "environment": "prod-jf0ozw",
+            "state": {"backend": "gcs", "locked": True},
+            "providerVersion": "~> 6.0",
+            "destroyApproved": False,
+            "resource": {
+                "address": "google_storage_bucket.data",
+                "type": "storage_bucket",
+                "action": "create",
+                "labels": {
+                    "owner": "student-g5puu",
+                    "environment": "production",
+                    "cost_center": "cc-gar5"
+                },
+                "secret": None,
+                "forceDestroy": False
+            }
+        }
+
+    def test_approve_valid_plan(self):
+        p = self.get_valid_tf_payload()
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "approve", "reason": "APPROVE"})
+
+    def test_invalid_plan_missing_top_level(self):
+        p = self.get_valid_tf_payload()
+        del p["state"]
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "INVALID_PLAN"})
+
+    def test_invalid_plan_bad_action(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["action"] = "destroy_all"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "INVALID_PLAN"})
+
+    def test_environment_mismatch(self):
+        p = self.get_valid_tf_payload()
+        p["environment"] = "staging-123"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"})
+
+    def test_state_unsafe_unlocked(self):
+        p = self.get_valid_tf_payload()
+        p["state"]["locked"] = False
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "STATE_UNSAFE"})
+
+    def test_state_unsafe_backend(self):
+        p = self.get_valid_tf_payload()
+        p["state"]["backend"] = "local"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "STATE_UNSAFE"})
+
+    def test_unpinned_provider_gte(self):
+        p = self.get_valid_tf_payload()
+        p["providerVersion"] = ">= 6.0"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "UNPINNED_PROVIDER"})
+
+    def test_unpinned_provider_wildcard(self):
+        p = self.get_valid_tf_payload()
+        p["providerVersion"] = "*"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "UNPINNED_PROVIDER"})
+
+    def test_missing_labels(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["labels"]["cost_center"] = "cc-wrong"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "MISSING_LABELS"})
+
+    def test_plaintext_secret(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["secret"] = "my-secret-password"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "PLAINTEXT_SECRET"})
+
+    def test_secret_ref_valid(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["secret"] = "secret://vault/db/password"
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "approve", "reason": "APPROVE"})
+
+    def test_delete_not_approved(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["action"] = "delete"
+        p["resource"]["type"] = "storage_bucket"
+        p["destroyApproved"] = False
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "DELETE_NOT_APPROVED"})
+
+    def test_delete_approved(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["action"] = "delete"
+        p["resource"]["type"] = "storage_bucket"
+        p["destroyApproved"] = True
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "approve", "reason": "APPROVE"})
+
+    def test_force_destroy_storage_bucket(self):
+        p = self.get_valid_tf_payload()
+        p["resource"]["forceDestroy"] = True
+        res = evaluate_terraform_plan(p)
+        self.assertEqual(res, {"decision": "reject", "reason": "FORCE_DESTROY"})
 
 
 if __name__ == "__main__":

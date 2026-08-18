@@ -3,11 +3,11 @@ from typing import Any, Dict, List
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="TDS GA7 Release Gate & Action Firewall")
+app = FastAPI(title="TDS GA7 Policy Gate Service")
 
-# -----------------------------------------------------------------------------
-# Question 1: Release Gate
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Question 1: Release Gate (POST /release-gate)
+# =============================================================================
 
 SHA_REGEX = re.compile(r"^[0-9a-f]{40}$")
 
@@ -122,9 +122,9 @@ async def release_gate_endpoint(request: Request):
     return JSONResponse(content=result)
 
 
-# -----------------------------------------------------------------------------
-# Question 2: LLM Action Firewall
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Question 2: LLM Action Firewall (POST /action-firewall)
+# =============================================================================
 
 ASSIGNED_TENANT = "tenant-75q9eyt"
 ASSIGNED_EMAIL_DOMAIN = "notify-869x73c.example"
@@ -249,7 +249,6 @@ def evaluate_action_firewall(payload: Dict[str, Any]) -> Dict[str, Any]:
     # If no rule fails -> ALLOW
     return {"decision": "allow", "reason": "ALLOW"}
 
-@app.post("/")
 @app.post("/action-firewall")
 @app.post("/action-firewall/")
 @app.post("/action-firewall/action-firewall")
@@ -260,6 +259,158 @@ async def action_firewall_endpoint(request: Request):
         payload = {}
     
     result = evaluate_action_firewall(payload)
+    return JSONResponse(content=result)
+
+
+# =============================================================================
+# Question 3: Terraform Plan Policy Gate (POST /terraform/plan)
+# =============================================================================
+
+ASSIGNED_WORKSPACE = "prod-jf0ozw"
+REQUIRED_LABELS = {
+    "owner": "student-g5puu",
+    "environment": "production",
+    "cost_center": "cc-gar5"
+}
+
+def is_provider_pinned(pv_str: str) -> bool:
+    if not isinstance(pv_str, str):
+        return False
+    pv = pv_str.strip()
+    if not pv:
+        return False
+    
+    if pv in ["*", "latest"] or "latest" in pv.lower() or "*" in pv:
+        return False
+
+    if pv.startswith("~>"):
+        rest = pv[2:].strip()
+        return bool(re.match(r"^\d+(\.\d+)+$", rest))
+    
+    if ">=" in pv or "<=" in pv or ">" in pv or "<" in pv:
+        return False
+
+    if pv.startswith("="):
+        rest = pv[1:].strip()
+        return bool(re.match(r"^\d+(\.\d+)+$", rest))
+
+    if re.match(r"^\d+(\.\d+)+$", pv):
+        return True
+
+    return False
+
+def evaluate_terraform_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Check 1: Top-level and nested value types (INVALID_PLAN)
+    if not isinstance(payload, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if "environment" not in payload or "state" not in payload or "providerVersion" not in payload or "destroyApproved" not in payload or "resource" not in payload:
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    env = payload["environment"]
+    if not isinstance(env, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    state = payload["state"]
+    if not isinstance(state, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if "backend" not in state or "locked" not in state:
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    backend = state["backend"]
+    locked = state["locked"]
+    if not isinstance(backend, str) or not isinstance(locked, bool):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    provider_version = payload["providerVersion"]
+    if not isinstance(provider_version, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    destroy_approved = payload["destroyApproved"]
+    if not isinstance(destroy_approved, bool):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    resource = payload["resource"]
+    if not isinstance(resource, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if "address" not in resource or "type" not in resource or "action" not in resource or "labels" not in resource or "secret" not in resource:
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    res_address = resource["address"]
+    res_type = resource["type"]
+    res_action = resource["action"]
+    res_labels = resource["labels"]
+    res_secret = resource["secret"]
+
+    if not isinstance(res_address, str) or not isinstance(res_type, str) or not isinstance(res_action, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if res_action not in ["create", "update", "delete"]:
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if not isinstance(res_labels, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    for k, v in res_labels.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    if res_secret is not None and not isinstance(res_secret, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    force_destroy = resource.get("forceDestroy")
+    if force_destroy is not None and not isinstance(force_destroy, bool):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    # Check 2: Environment match (ENVIRONMENT_MISMATCH)
+    if env != ASSIGNED_WORKSPACE:
+        return {"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"}
+
+    # Check 3: State backend & locking (STATE_UNSAFE)
+    allowed_backends = {"gcs", "s3", "azurerm", "remote"}
+    if backend not in allowed_backends or locked is not True:
+        return {"decision": "reject", "reason": "STATE_UNSAFE"}
+
+    # Check 4: Provider pinning (UNPINNED_PROVIDER)
+    if not is_provider_pinned(provider_version):
+        return {"decision": "reject", "reason": "UNPINNED_PROVIDER"}
+
+    # Check 5: Assigned labels (MISSING_LABELS)
+    for req_k, req_v in REQUIRED_LABELS.items():
+        if res_labels.get(req_k) != req_v:
+            return {"decision": "reject", "reason": "MISSING_LABELS"}
+
+    # Check 6: Plaintext secret (PLAINTEXT_SECRET)
+    if res_secret is not None:
+        if not (res_secret.startswith("secret://") and len(res_secret) > len("secret://")):
+            return {"decision": "reject", "reason": "PLAINTEXT_SECRET"}
+
+    # Check 7: Stateful delete approval (DELETE_NOT_APPROVED)
+    stateful_types = ["storage_bucket", "sql_database", "persistent_disk"]
+    is_stateful = any(st in res_type for st in stateful_types)
+    if res_action == "delete" and is_stateful and destroy_approved is not True:
+        return {"decision": "reject", "reason": "DELETE_NOT_APPROVED"}
+
+    # Check 8: Force destroy on storage bucket (FORCE_DESTROY)
+    if "storage_bucket" in res_type and force_destroy is True:
+        return {"decision": "reject", "reason": "FORCE_DESTROY"}
+
+    # If all rules pass -> APPROVE
+    return {"decision": "approve", "reason": "APPROVE"}
+
+@app.post("/")
+@app.post("/terraform/plan")
+@app.post("/terraform/plan/")
+@app.post("/terraform/plan/terraform/plan")
+async def terraform_plan_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    
+    result = evaluate_terraform_plan(payload)
     return JSONResponse(content=result)
 
 if __name__ == "__main__":
